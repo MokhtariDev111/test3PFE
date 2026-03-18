@@ -1,9 +1,15 @@
 """
-app.py — Step 11: Streamlit Web Interface (3-Tab Edition)
-=========================================================
+app.py — Step 11: Streamlit Web Interface (3-Tab Edition + Voice Input)
+=========================================================================
 Tab 1 — 🎯 Generate  : Run the full RAG → PPTX pipeline
 Tab 2 — 🖼️ Preview   : Visual slide carousel with navigation
 Tab 3 — 📚 History   : Dashboard of all past presentations
+
+NEW: 🎙️ Voice input via OpenAI Whisper (base model, runs locally)
+     Install: pip install openai-whisper sounddevice scipy
+     The microphone button records audio, transcribes it with Whisper,
+     and fills the topic text area automatically.
+
 Run: streamlit run app.py
 """
 
@@ -14,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import streamlit as st
 import tempfile
 import shutil
+import os
+import hashlib
 
 from modules.config_loader import CONFIG
 from modules.ingestion import ingest_directory
@@ -26,10 +34,36 @@ from modules.slide_generator import build_slides
 from modules.pptx_exporter import export_pptx, THEMES
 from modules.diagram_generator import generate_all_diagrams
 from modules.history_store import record_presentation, load_history, clear_history
+from streamlit_mic_recorder import mic_recorder, speech_to_text
 
 ROOT_DIR = Path(__file__).resolve().parent
 
-# ── Page Config ──────────────────────────────────────────────────────────────
+
+def _fingerprint_uploaded_files(files) -> str:
+    """Stable fingerprint for the current upload selection."""
+    h = hashlib.sha256()
+    for f in sorted(files, key=lambda x: x.name):
+        data = f.getvalue()
+        h.update(f.name.encode("utf-8", errors="ignore"))
+        h.update(str(len(data)).encode("utf-8"))
+        # Cheaper hash of contents to avoid huge concatenation
+        h.update(hashlib.md5(data).digest())
+    return h.hexdigest()
+
+
+def _fingerprint_dir_files(dir_path: Path) -> str:
+    """Fingerprint based on names/sizes/mtimes (fast, no content reads)."""
+    h = hashlib.sha256()
+    if not dir_path.exists():
+        return ""
+    for p in sorted([x for x in dir_path.iterdir() if x.is_file()], key=lambda x: x.name):
+        stinfo = p.stat()
+        h.update(p.name.encode("utf-8", errors="ignore"))
+        h.update(str(stinfo.st_size).encode("utf-8"))
+        h.update(str(int(stinfo.st_mtime)).encode("utf-8"))
+    return h.hexdigest()
+
+# ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AI Teaching Assistant",
     page_icon="🎓",
@@ -99,6 +133,20 @@ div[data-testid="stDownloadButton"] > button {
     padding-bottom: 0.4rem; margin: 1rem 0 0.6rem;
 }
 
+/* Voice input status box */
+.voice-box {
+    background: linear-gradient(135deg, #0d2a1a, #0f3320);
+    border: 1px solid #27ae60; border-radius: 10px;
+    padding: 0.8rem 1.2rem; margin: 0.5rem 0;
+    color: #82efaa; font-size: 0.9rem;
+}
+.voice-box-error {
+    background: linear-gradient(135deg, #2a0d0d, #330f0f);
+    border: 1px solid #c0392b; border-radius: 10px;
+    padding: 0.8rem 1.2rem; margin: 0.5rem 0;
+    color: #ff8a80; font-size: 0.9rem;
+}
+
 /* History card */
 .hist-card {
     background: linear-gradient(135deg, #0f1e35, #162840);
@@ -125,6 +173,7 @@ div[data-testid="stDownloadButton"] > button {
 """, unsafe_allow_html=True)
 
 
+
 # ── Session State Init ────────────────────────────────────────────────────────
 if "slides"       not in st.session_state: st.session_state.slides       = []
 if "pptx_bytes"   not in st.session_state: st.session_state.pptx_bytes   = None
@@ -134,6 +183,9 @@ if "theme_cfg"    not in st.session_state: st.session_state.theme_cfg     = None
 if "slide_idx"    not in st.session_state: st.session_state.slide_idx     = 0
 if "last_prompt"  not in st.session_state: st.session_state.last_prompt   = ""
 if "last_topic"   not in st.session_state: st.session_state.last_topic    = ""
+if "query_input"  not in st.session_state: st.session_state.query_input   = ""
+if "docs_fp"      not in st.session_state: st.session_state.docs_fp       = None
+if "retriever"    not in st.session_state: st.session_state.retriever     = None
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -150,13 +202,14 @@ with st.sidebar:
 
     st.markdown('<div class="section-header">🤖 AI Settings</div>', unsafe_allow_html=True)
     model_name  = st.selectbox("Ollama Model", ["mistral","llama3.2","qwen2.5"], index=0)
-    top_k       = st.slider("Context Chunks (top-k)", 2, 8, 4)
+    # Use only the single best retrieved chunk for speed and focus.
+    top_k       = 1
     diagrams_on = st.toggle("Generate Diagrams", value=True)
 
 CONFIG["llm"]["model"] = model_name
 
 
-# ── Helper: render a single slide as themed HTML ─────────────────────────────
+# ── Helper: render a single slide as themed HTML ──────────────────────────────
 def _slide_html(s, idx: int, theme, diagrams: dict, show_full: bool = True) -> str:
     bg     = "#{:02X}{:02X}{:02X}".format(*theme.bg)
     accent = "#{:02X}{:02X}{:02X}".format(*theme.accent)
@@ -198,9 +251,9 @@ def _slide_html(s, idx: int, theme, diagrams: dict, show_full: bool = True) -> s
 tab_gen, tab_prev, tab_hist = st.tabs(["🎯 Generate", "🖼️ Preview", "📚 History"])
 
 
-# ════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — GENERATE
-# ════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 with tab_gen:
     st.markdown("""
     <div class="hero-banner">
@@ -209,55 +262,102 @@ with tab_gen:
     </div>
     """, unsafe_allow_html=True)
 
-    query = st.text_area("💬 Topic or question",
-        placeholder='"Explain the Transformer attention mechanism"',
-        height=90, key="query_input")
+    # Single unified query input
+    col_h, col_v = st.columns([3, 1])
+    with col_h:
+        st.markdown("### ✍️ Topic & Prompt")
+    with col_v:
+        # Transcription area - made more compact
+        voice_text = speech_to_text(
+            language='en',
+            start_prompt="🎙️ Speak", # Shorter text
+            stop_prompt="🛑 Stop", 
+            just_once=False,
+            use_container_width=True,
+            key='STT'
+        )
+    
+    if voice_text:
+        # Push the transcribed text into the session state for the text area
+        st.session_state.query_input = voice_text
+        st.info(f"🎤 {voice_text[:60]}{'...' if len(voice_text) > 60 else ''}")
+        
+    with st.form("generate_presentation_form", clear_on_submit=True):
+        query = st.text_area(
+            "💬 What do you want to learn today?",
+            placeholder=(
+                "Example: \"Explain quantum mechanics for beginners (high-school level).\" \n"
+                "Or: \"Create a 5-slide lesson on the Roman Empire: timeline, key emperors, and 3 takeaways.\""
+            ),
+            height=140,
+            key="query_input",  # This key automatically links to st.session_state.query_input
+        )
 
-    col_btn, col_pad = st.columns([1, 3])
-    with col_btn:
-        go = st.button("⚡ Generate Slides")
+        col_btn, col_pad = st.columns([1, 2])
+        with col_btn:
+            go = st.form_submit_button("⚡ Generate Presentation", use_container_width=True)
 
     if go:
         if not query.strip():
-            st.error("⚠️ Please enter a topic first.")
+            st.error("⚠️ Please enter a topic first! (Type it or use the 🎙️ voice button above)")
             st.stop()
+        # Start the pipeline
+        st.session_state.last_prompt = query
+        index_base = Path(CONFIG["vector_db"]["index_path"])
+        index_files_exist = index_base.with_suffix(".index").exists() and index_base.with_suffix(".pkl").exists()
+
+        if uploaded:
+            docs_fp = f"upload:{_fingerprint_uploaded_files(uploaded)}"
+        else:
+            src = ROOT_DIR / CONFIG["paths"]["data_raw"]
+            docs_fp = f"dir:{_fingerprint_dir_files(src)}"
+
+        need_rebuild_index = (st.session_state.docs_fp != docs_fp) or (not index_files_exist)
 
         tmp_dir = Path(tempfile.mkdtemp())
         raw_dir = tmp_dir / "raw"
         raw_dir.mkdir()
 
-        if uploaded:
-            for f in uploaded:
-                (raw_dir / f.name).write_bytes(f.getvalue())
-        else:
-            src = ROOT_DIR / CONFIG["paths"]["data_raw"]
-            if src.exists():
-                for p in src.iterdir():
-                    shutil.copy(p, raw_dir / p.name)
+        if need_rebuild_index:
+            if uploaded:
+                for f in uploaded:
+                    (raw_dir / f.name).write_bytes(f.getvalue())
+            else:
+                if src.exists():
+                    for p in src.iterdir():
+                        if p.is_file():
+                            shutil.copy(p, raw_dir / p.name)
 
         theme = THEMES[theme_name]
 
-        with st.status("🚀 Running AI pipeline...", expanded=True) as status_box:
-            st.write("**Step 2** — Ingesting documents...")
-            pages = ingest_directory(raw_dir)
-            st.write(f"  ✅ {len(pages)} pages from {len(list(raw_dir.iterdir()))} file(s).")
+        with st.status("🚀 Running AI pipeline...", expanded=True) as status:
+            if need_rebuild_index:
+                st.write("**Step 2** — Ingesting documents...")
+                pages = ingest_directory(raw_dir)
+                st.write(f"  ✅ {len(pages)} pages from {len(list(raw_dir.iterdir()))} file(s).")
 
-            st.write("**Step 3** — OCR...")
-            pages = run_ocr(pages)
-            st.write(f"  ✅ {len([p for p in pages if p.type=='image'])} image(s) processed.")
+                st.write("**Step 3** — OCR...")
+                pages = run_ocr(pages)
+                st.write(f"  ✅ {len([p for p in pages if p.type=='image'])} image(s) processed.")
 
-            st.write("**Step 4** — Chunking text...")
-            chunks = process_pages(pages)
-            st.write(f"  ✅ {len(chunks)} chunks.")
+                st.write("**Step 4** — Chunking text...")
+                chunks = process_pages(pages)
+                st.write(f"  ✅ {len(chunks)} chunks.")
 
-            st.write("**Step 5** — Building FAISS index...")
-            build_vector_db(chunks)
-            st.write("  ✅ Index saved.")
+                st.write("**Step 5** — Building FAISS index...")
+                build_vector_db(chunks)
+                st.write("  ✅ Index saved.")
 
-            st.write(f"**Step 6** — Retrieving top {top_k} chunks...")
-            retriever = Retriever()
-            results = retriever.search(query, top_k=top_k)
-            st.write(f"  ✅ {len(results)} chunks retrieved.")
+                st.session_state.docs_fp = docs_fp
+                st.session_state.retriever = None  # force reload with new index
+            else:
+                st.write("**Steps 2–5** — Using existing vector index (no document changes).")
+
+            st.write("**Step 6** — Retrieving best matching context...")
+            if st.session_state.retriever is None:
+                st.session_state.retriever = Retriever()
+            results = st.session_state.retriever.search(query, top_k=top_k)
+            st.write("  ✅ Context retrieved.")
 
             st.write(f"**Step 8** — Generating {num_slides}-slide plan ({model_name})...")
             engine = PedagogicalEngine()
@@ -281,27 +381,23 @@ with tab_gen:
             pptx_path = export_pptx(slides, theme=theme, diagrams=diag_map)
             st.write(f"  ✅ `{Path(pptx_path).name}`")
 
-            status_box.update(label="✅ Done!", state="complete", expanded=False)
+            status.update(label="✅ Done!", state="complete", expanded=False)
 
-        # Read bytes before cleanup
         with open(pptx_path, "rb") as fh:
             pptx_bytes = fh.read()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        # Save to history
         record_presentation(pptx_path, query, topic, len(slides), theme_name, model_name)
 
-        # Store in session state for Preview tab
-        st.session_state.slides     = slides
-        st.session_state.pptx_bytes = pptx_bytes
-        st.session_state.pptx_fname = Path(pptx_path).name
-        st.session_state.diagrams   = diag_map
-        st.session_state.theme_cfg  = theme
-        st.session_state.slide_idx  = 0
+        st.session_state.slides      = slides
+        st.session_state.pptx_bytes  = pptx_bytes
+        st.session_state.pptx_fname  = Path(pptx_path).name
+        st.session_state.diagrams    = diag_map
+        st.session_state.theme_cfg   = theme
+        st.session_state.slide_idx   = 0
         st.session_state.last_prompt = query
         st.session_state.last_topic  = topic
 
-        # Quick summary in generate tab
         st.markdown("---")
         st.success(f"✅ **{len(slides)} slide(s)** generated! "
                    f"Switch to the **🖼️ Preview** tab to review before downloading.")
@@ -316,9 +412,9 @@ with tab_gen:
             )
 
 
-# ════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — PREVIEW
-# ════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 with tab_prev:
     slides   = st.session_state.slides
     theme    = st.session_state.theme_cfg
@@ -335,12 +431,10 @@ with tab_prev:
         n = len(slides)
         idx = st.session_state.slide_idx
 
-        # Topic header
         st.markdown(f"### 🖼️ {st.session_state.last_topic or 'Presentation Preview'}")
         st.caption(f"Prompt: *\"{st.session_state.last_prompt[:120]}\"*")
         st.markdown("---")
 
-        # ── Navigation bar ──
         nav_l, nav_c, nav_r = st.columns([1, 2, 1])
         with nav_l:
             if st.button("◀ Previous", disabled=(idx == 0), key="prev_slide"):
@@ -358,16 +452,13 @@ with tab_prev:
                 st.session_state.slide_idx = min(n - 1, idx + 1)
                 st.rerun()
 
-        # ── Current slide ──
         s = slides[idx]
         st.markdown(_slide_html(s, idx, theme, diagrams, show_full=True),
                     unsafe_allow_html=True)
 
-        # ── Diagram image if available ──
         if idx in diagrams and Path(diagrams[idx]).exists():
             st.image(diagrams[idx], caption=f"📊 Diagram for slide {idx+1}", use_container_width=True)
 
-        # ── Thumbnail strip ──
         st.markdown("---")
         st.markdown("**All slides:**")
         cols = st.columns(min(n, 5))
@@ -391,7 +482,6 @@ with tab_prev:
                     st.session_state.slide_idx = j
                     st.rerun()
 
-        # ── Download from Preview tab too ──
         st.markdown("---")
         if st.session_state.pptx_bytes:
             st.download_button(
@@ -403,9 +493,9 @@ with tab_prev:
             )
 
 
-# ════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — HISTORY
-# ════════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
 with tab_hist:
     records = load_history()
 
@@ -421,7 +511,6 @@ with tab_hist:
     if not records:
         st.info("No presentations generated yet. Use the **🎯 Generate** tab to create your first one!")
     else:
-        # ── Stats bar ──
         total_slides = sum(r.get("num_slides", 0) for r in records)
         total_size   = sum(r.get("size_kb", 0) for r in records)
         c1, c2, c3 = st.columns(3)
@@ -430,7 +519,6 @@ with tab_hist:
         c3.metric("💾 Total Size", f"{total_size:.0f} KB")
         st.markdown("---")
 
-        # ── Search / filter ──
         search = st.text_input("🔍 Filter by keyword", placeholder="e.g. 'transformer'")
         filtered = [r for r in records if not search or search.lower() in r.get("prompt","").lower() or search.lower() in r.get("topic","").lower()]
         st.caption(f"Showing {len(filtered)} of {len(records)} presentations")

@@ -30,6 +30,45 @@ if not log.hasHandlers():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
 
 
+def _to_float(x) -> float | None:
+    """Best-effort conversion for LLM-provided numbers."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float, np.number)):
+            return float(x)
+        if isinstance(x, str):
+            s = x.strip()
+            # remove common formatting like commas and percent signs
+            s = s.replace(",", "")
+            s = re.sub(r"%$", "", s)
+            if not s:
+                return None
+            return float(s)
+        return None
+    except Exception:
+        return None
+
+
+def _normalize_bar_data(labels, values):
+    """Coerce labels/values into aligned (labels:list[str], values:list[float])."""
+    if not isinstance(labels, list):
+        labels = [str(labels)]
+    if not isinstance(values, list):
+        values = [values]
+
+    fvals: list[float] = []
+    for v in values:
+        fv = _to_float(v)
+        if fv is None:
+            continue
+        fvals.append(fv)
+
+    slabels = [str(l) for l in labels]
+    n = min(len(slabels), len(fvals))
+    return slabels[:n], fvals[:n]
+
+
 def _style_fig(fig, ax, bg: str = "#0D1B2A", text: str = "#FFFFFF"):
     """Apply consistent dark‐theme styling to a Matplotlib figure."""
     fig.patch.set_facecolor(bg)
@@ -46,8 +85,9 @@ def _bar_chart(title: str, labels: list[str], values: list[float], color: str, o
     bars = ax.bar(labels, values, color=color, edgecolor="#0D1B2A", linewidth=0.8)
     ax.set_title(title, color="white", fontsize=11, fontweight="bold", pad=8)
     _style_fig(fig, ax)
+    max_val = max(values) if values else 0.0
     for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01 * max(values),
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01 * max_val,
                 f"{val:.1f}", ha="center", va="bottom", color="white", fontsize=8)
     plt.tight_layout()
     plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -133,6 +173,9 @@ def generate_all_diagrams(slides, theme_color: str = "#1F6FEB",
         if info.get("type") == "bar":
             labels = info.get("labels", ["A", "B", "C"])
             values = info.get("values", [10, 20, 30])
+            labels, values = _normalize_bar_data(labels, values)
+            if not labels or not values:
+                continue
             _bar_chart(info.get("title", slide.title), labels, values, theme_color, out_path)
             diagrams[i] = out_path
             log.info(f"  ✔ Bar chart generated for slide {i}.")
