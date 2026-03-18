@@ -1,9 +1,13 @@
 """
-diagram_generator.py — Step 11 Support: AI-Assisted Diagram Generation
-======================================================================
+diagram_generator.py — Mermaid Diagram Generator
+===================================================
 For each content slide, asks the LLM what kind of diagram would help,
-then generates a styled Matplotlib chart/diagram and saves it as a PNG.
-Returns a dict mapping slide index -> image path.
+then generates the corresponding Mermaid syntax (and optionally a PNG via
+matplotlib as a fallback for the PPTX export).
+
+The returned dict maps: slide_index → {"mermaid": str, "png": str|None}
+so the React frontend can render the live Mermaid diagram, and the PPTX
+exporter can embed the PNG if needed.
 """
 import json
 import logging
@@ -30,47 +34,71 @@ if not log.hasHandlers():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Mermaid generators
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mermaid_bar(title: str, labels: list[str], values: list[float]) -> str:
+    """Generate Mermaid xychart-beta bar chart syntax."""
+    x_labels = " ".join(f'"{l}"' for l in labels[:8])
+    y_values  = ", ".join(str(round(v, 1)) for v in values[:8])
+    return (
+        "xychart-beta\n"
+        f'  title "{title}"\n'
+        f"  x-axis [{x_labels}]\n"
+        f"  bar [{y_values}]"
+    )
+
+
+def _mermaid_flow(title: str, steps: list[str]) -> str:
+    """Generate Mermaid flowchart TD syntax."""
+    lines = [f"flowchart TD", f'  title["{title}"]']
+    node_ids = [chr(65 + i) for i in range(len(steps))]  # A, B, C, …
+    for nid, step in zip(node_ids, steps):
+        safe = step.replace('"', "'")
+        lines.append(f'  {nid}["{safe}"]')
+    # Add arrows between consecutive nodes
+    for i in range(len(node_ids) - 1):
+        lines.append(f"  {node_ids[i]} --> {node_ids[i+1]}")
+    return "\n".join(lines)
+
+
+def _mermaid_mindmap(title: str, items: list[str]) -> str:
+    """Generate Mermaid mindmap syntax."""
+    lines = ["mindmap", f"  root((\"{title}\"))"]
+    for item in items[:6]:
+        safe = item.replace('"', "'")[:50]
+        lines.append(f'    ("{safe}")')
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Matplotlib PNG fallback (kept for PPTX embed)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _to_float(x) -> float | None:
-    """Best-effort conversion for LLM-provided numbers."""
     try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float, np.number)):
-            return float(x)
+        if x is None: return None
+        if isinstance(x, (int, float, np.number)): return float(x)
         if isinstance(x, str):
-            s = x.strip()
-            # remove common formatting like commas and percent signs
-            s = s.replace(",", "")
+            s = x.strip().replace(",", "")
             s = re.sub(r"%$", "", s)
-            if not s:
-                return None
-            return float(s)
+            return float(s) if s else None
         return None
     except Exception:
         return None
 
 
 def _normalize_bar_data(labels, values):
-    """Coerce labels/values into aligned (labels:list[str], values:list[float])."""
-    if not isinstance(labels, list):
-        labels = [str(labels)]
-    if not isinstance(values, list):
-        values = [values]
-
-    fvals: list[float] = []
-    for v in values:
-        fv = _to_float(v)
-        if fv is None:
-            continue
-        fvals.append(fv)
-
+    if not isinstance(labels, list): labels = [str(labels)]
+    if not isinstance(values, list): values = [values]
+    fvals = [f for v in values if (f := _to_float(v)) is not None]
     slabels = [str(l) for l in labels]
     n = min(len(slabels), len(fvals))
     return slabels[:n], fvals[:n]
 
 
 def _style_fig(fig, ax, bg: str = "#0D1B2A", text: str = "#FFFFFF"):
-    """Apply consistent dark‐theme styling to a Matplotlib figure."""
     fig.patch.set_facecolor(bg)
     ax.set_facecolor(bg)
     ax.tick_params(colors=text, labelsize=9)
@@ -80,7 +108,7 @@ def _style_fig(fig, ax, bg: str = "#0D1B2A", text: str = "#FFFFFF"):
         spine.set_edgecolor("#2A3A50")
 
 
-def _bar_chart(title: str, labels: list[str], values: list[float], color: str, out_path: str) -> str:
+def _bar_chart_png(title: str, labels: list[str], values: list[float], color: str, out_path: str) -> str:
     fig, ax = plt.subplots(figsize=(5.5, 3.2))
     bars = ax.bar(labels, values, color=color, edgecolor="#0D1B2A", linewidth=0.8)
     ax.set_title(title, color="white", fontsize=11, fontweight="bold", pad=8)
@@ -95,7 +123,7 @@ def _bar_chart(title: str, labels: list[str], values: list[float], color: str, o
     return out_path
 
 
-def _flow_diagram(title: str, steps: list[str], color: str, out_path: str) -> str:
+def _flow_diagram_png(title: str, steps: list[str], color: str, out_path: str) -> str:
     n = len(steps)
     fig, ax = plt.subplots(figsize=(5.5, 3.2))
     ax.set_xlim(0, 10); ax.set_ylim(0, n + 1)
@@ -118,21 +146,21 @@ def _flow_diagram(title: str, steps: list[str], color: str, out_path: str) -> st
     return out_path
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM-based decision
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _decide_diagram(slide_title: str, bullets: list[str], llm: LLMEngine) -> dict | None:
-    """
-    Ask the LLM whether a diagram is useful for this slide and what kind.
-    Returns a dict or None if no diagram is needed.
-    """
     bullets_text = "\n".join(f"- {b}" for b in bullets)
     prompt = (
         "You are a data visualization expert. Given a slide's content, "
         "decide if a simple diagram would help (yes or no), and if yes, what type.\n\n"
         f"Slide Title: {slide_title}\nBullets:\n{bullets_text}\n\n"
         "Respond ONLY with JSON, no other text:\n"
-        '{"diagram": true/false, "type": "bar"|"flow"|"none", '
+        '{"diagram": true/false, "type": "bar"|"flow"|"mindmap"|"none", '
         '"title": "short chart title", '
         '"labels": ["A","B","C"], "values": [10, 20, 30]}\n'
-        "For flow: use 'steps' key instead of labels/values: [\"Step 1\", \"Step 2\", ...]"
+        "For flow/mindmap: use 'steps' key instead of labels/values: [\"Step 1\", \"Step 2\", ...]"
     )
     raw = llm.generate("", [], prompt_override=prompt)
     raw = re.sub(r"```(?:json)?", "", raw).strip()
@@ -148,16 +176,24 @@ def _decide_diagram(slide_title: str, bullets: list[str], llm: LLMEngine) -> dic
         return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
 def generate_all_diagrams(slides, theme_color: str = "#1F6FEB",
-                           tmp_dir: str = None) -> dict[int, str]:
+                           tmp_dir: str = None) -> dict[int, dict]:
     """
-    For each content slide, optionally generate a diagram PNG.
-    Returns a mapping { slide_index: png_path }.
+    For each content slide, optionally generate a diagram.
+    Returns a mapping:
+        { slide_index: {"mermaid": "<mermaid syntax>", "png": "<path or None>"} }
+
+    The React frontend renders the Mermaid syntax live.
+    The PPTX exporter uses the PNG fallback (generated by matplotlib).
     """
     llm = LLMEngine()
     tmp = Path(tmp_dir or tempfile.mkdtemp())
     tmp.mkdir(parents=True, exist_ok=True)
-    diagrams: dict[int, str] = {}
+    diagrams: dict[int, dict] = {}
 
     for i, slide in enumerate(slides):
         if slide.slide_type != "content" or not slide.bullets:
@@ -168,22 +204,40 @@ def generate_all_diagrams(slides, theme_color: str = "#1F6FEB",
         if not info:
             continue
 
-        out_path = str(tmp / f"slide_{i}.png")
+        out_png = str(tmp / f"slide_{i}.png")
+        diag_type = info.get("type", "none")
+        diag_title = info.get("title", slide.title)
 
-        if info.get("type") == "bar":
+        mermaid_src: str | None = None
+        png_path:    str | None = None
+
+        if diag_type == "bar":
             labels = info.get("labels", ["A", "B", "C"])
             values = info.get("values", [10, 20, 30])
             labels, values = _normalize_bar_data(labels, values)
-            if not labels or not values:
-                continue
-            _bar_chart(info.get("title", slide.title), labels, values, theme_color, out_path)
-            diagrams[i] = out_path
-            log.info(f"  ✔ Bar chart generated for slide {i}.")
+            if labels and values:
+                mermaid_src = _mermaid_bar(diag_title, labels, values)
+                try:
+                    _bar_chart_png(diag_title, labels, values, theme_color, out_png)
+                    png_path = out_png
+                except Exception as e:
+                    log.warning(f"PNG fallback failed for slide {i}: {e}")
+                diagrams[i] = {"mermaid": mermaid_src, "png": png_path}
+                log.info(f"  ✔ Bar chart (Mermaid + PNG) for slide {i}.")
 
-        elif info.get("type") == "flow":
-            steps = info.get("steps", slide.bullets[:4])
-            _flow_diagram(info.get("title", slide.title), steps, theme_color, out_path)
-            diagrams[i] = out_path
-            log.info(f"  ✔ Flow diagram generated for slide {i}.")
+        elif diag_type in ("flow", "mindmap"):
+            steps = info.get("steps", slide.bullets[:5])
+            if diag_type == "flow":
+                mermaid_src = _mermaid_flow(diag_title, steps)
+                try:
+                    _flow_diagram_png(diag_title, steps, theme_color, out_png)
+                    png_path = out_png
+                except Exception as e:
+                    log.warning(f"PNG fallback failed for slide {i}: {e}")
+            else:  # mindmap
+                mermaid_src = _mermaid_mindmap(diag_title, steps)
+                # mindmap has no PNG equivalent — Mermaid only
+            diagrams[i] = {"mermaid": mermaid_src, "png": png_path}
+            log.info(f"  ✔ {diag_type.capitalize()} diagram (Mermaid) for slide {i}.")
 
     return diagrams

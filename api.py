@@ -77,17 +77,15 @@ _pptx_store: dict[str, str] = {}
 def _slides_to_json(slides, diagrams: dict) -> list[dict]:
     result = []
     for i, s in enumerate(slides):
-        diag = None
-        if i in diagrams and Path(diagrams[i]).exists():
-            # Embed diagram path as a relative URL — frontend can request it
-            # or we send the mermaid source if available
-            diag = None  # diagrams are image files; for now skip binary
+        # diagrams[i] is now {"mermaid": str, "png": str|None}
+        diag_info = diagrams.get(i, {})
+        mermaid_src = diag_info.get("mermaid") if isinstance(diag_info, dict) else None
         result.append({
             "id": i + 1,
             "title": s.title,
             "bullets": s.bullets,
             "speakerNotes": s.speaker_notes or "",
-            "diagram": diag,
+            "diagram": mermaid_src,  # Mermaid syntax string or None
             "slideType": s.slide_type,
         })
     return result
@@ -103,6 +101,7 @@ async def generate(
     num_slides: int = Form(5),
     model: str = Form("mistral"),
     top_k: int = Form(4),
+    language: str = Form("English"),
     files: list[UploadFile] = File(default=[]),
 ):
     """
@@ -150,12 +149,12 @@ async def generate(
         results = retriever.search(prompt, top_k=top_k)
 
         engine = PedagogicalEngine()
-        lesson = engine.generate_lesson(prompt, results, num_slides=num_slides)
+        lesson = engine.generate_lesson(prompt, results, num_slides=num_slides, language=language)
         topic = lesson.get("topic", prompt[:40])
 
         slides = build_slides(lesson)
 
-        # Diagrams (optional — may fail gracefully)
+        # Diagrams — new format: {slide_idx: {"mermaid": str, "png": str|None}}
         diag_map: dict = {}
         try:
             accent_hex = "#{:02X}{:02X}{:02X}".format(*selected_theme.accent)
@@ -164,7 +163,9 @@ async def generate(
         except Exception as e:
             log.warning("Diagram generation failed (non-fatal): %s", e)
 
-        pptx_path = export_pptx(slides, theme=selected_theme, diagrams=diag_map)
+        # Build PNG-only map for PPTX, Mermaid map for frontend
+        png_map = {k: v["png"] for k, v in diag_map.items() if v.get("png")}
+        pptx_path = export_pptx(slides, theme=selected_theme, diagrams=png_map)
         log.info("PPTX saved to %s", pptx_path)
 
         # 4. Store path for download

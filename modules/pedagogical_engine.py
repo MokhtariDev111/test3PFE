@@ -58,10 +58,11 @@ JSON_INSTRUCTION = (
     + json.dumps(LESSON_SCHEMA, indent=2)
     + "\n\nRULES:\n"
     "- Generate exactly NUM_SLIDES content slides (plus a title slide will be added automatically).\n"
+    "- LANGUAGE: Write ALL slide content in SLIDE_LANGUAGE.\n"
     "- Make the slide content RICH and DETAILED. Do not just use a few words.\n"
     "- Each slide must have 3 to 5 detailed bullet points. Include key facts, examples, and deep context from the source material.\n"
     "- Speaker notes should be comprehensive (3-4 sentences) explaining the concepts deeply to the teacher.\n"
-    "- The 'topic' field MUST be a short, descriptive phrase (max 4-5 words) summarizing the presentation (e.g., 'Transformer-Attention-Mechanism' or 'Intro-to-Photosynthesis'). We use this as the filename.\n"
+    "- The 'topic' field MUST be a short, descriptive phrase (max 4-5 words) in English, suitable as a filename (e.g., 'Transformer-Attention-Mechanism').\n"
     "- Do NOT include any text outside the JSON object.\n"
 )
 
@@ -70,10 +71,16 @@ class PedagogicalEngine:
     def __init__(self):
         self.llm = LLMEngine()
 
-    def _build_pedagogical_prompt(self, query: str, context_chunks: list[TextChunk], num_slides: int = 3) -> str:
+    def _build_pedagogical_prompt(self, query: str, context_chunks: list[TextChunk],
+                                   num_slides: int = 3, language: str = "English") -> str:
         """Builds a structured prompt requesting JSON lesson output."""
         context_text = "\n".join(f"- {chunk.text}" for chunk in context_chunks)
-        instruction = JSON_INSTRUCTION.replace("NUM_SLIDES", str(num_slides))
+        lang_label = "French" if language.lower() in ("fr", "french", "français") else "English"
+        instruction = (
+            JSON_INSTRUCTION
+            .replace("NUM_SLIDES", str(num_slides))
+            .replace("SLIDE_LANGUAGE", lang_label)
+        )
 
         return (
             f"{instruction}\n\n"
@@ -104,13 +111,15 @@ class PedagogicalEngine:
             log.warning(f"Could not parse JSON from LLM output: {e}")
             return {"topic": "Unknown", "slides": [], "_raw": raw}
 
-    def generate_lesson(self, query: str, context_chunks: list[TextChunk], num_slides: int = 3) -> dict:
+    def generate_lesson(self, query: str, context_chunks: list[TextChunk],
+                        num_slides: int = 3, language: str = "English") -> dict:
         """Main entry point for Step 8: produces a structured JSON lesson."""
         if not context_chunks:
             return {"topic": query, "slides": [], "_error": "No context retrieved."}
 
-        prompt = self._build_pedagogical_prompt(query, context_chunks, num_slides=num_slides)
-        log.info(f"Requesting lesson plan for: '{query}' ({num_slides} slides)...")
+        prompt = self._build_pedagogical_prompt(query, context_chunks,
+                                                num_slides=num_slides, language=language)
+        log.info(f"Requesting lesson plan for: '{query}' ({num_slides} slides, lang={language})...")
 
         raw_output = self.llm.generate(query, context_chunks, prompt_override=prompt)
 
