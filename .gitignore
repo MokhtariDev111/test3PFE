@@ -1,0 +1,39 @@
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# ── Virtual environments ────────────────────────────────────
+.venv311/
+venv/
+env/
+
+# ── OS junk ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE / Editor ─────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Project data (may be large) ──────────────────────────────
+data/raw/*
+data/processed/*
+data/output/*
+outputs/*
+logs/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/output/.gitkeep
+!outputs/.gitkeep
+!logs/.gitkeep
+
+# ── Models (large binaries) ──────────────────────────────────
+models/
+
+# ── Environment variables ────────────────────────────────────
+.env
