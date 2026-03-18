@@ -1,0 +1,150 @@
+RAG Benchmarking Framework — Overview
+
+This document serves as the primary knowledge base for the RAG Benchmark Framework.
+It is used to populate the vector store with searchable content for evaluation purposes.
+
+=== SECTION 1: RETRIEVAL-AUGMENTED GENERATION (RAG) ===
+
+Retrieval-Augmented Generation (RAG) is a technique that combines information retrieval
+with large language model generation. The model first retrieves relevant documents from
+a knowledge base, then uses them as context to generate accurate and grounded answers.
+RAG significantly reduces hallucination compared to pure LLM generation by grounding
+the response in retrieved evidence.
+
+RAG pipelines consist of two main phases:
+1. Indexing phase: documents are loaded, cleaned, chunked, embedded, and stored in a vector database.
+2. Query phase: the user query is embedded, similar chunks are retrieved, and an LLM generates an answer.
+
+=== SECTION 2: CHUNKING STRATEGIES ===
+
+Common chunking strategies used in RAG pipelines include:
+
+Fixed-size chunking divides text into equal-sized segments of a predetermined token or
+character count. This is simple and predictable but may split sentences mid-way.
+
+Recursive character splitting uses a hierarchy of separators (paragraphs, newlines, spaces)
+to split text while trying to keep semantically complete units together.
+
+Sliding window chunking creates overlapping chunks, where each new chunk shares some tokens
+with the previous one. This reduces the chance of losing context at chunk boundaries.
+
+Semantic chunking groups sentences or paragraphs by semantic similarity using embedding
+models, creating chunks that represent coherent conceptual units.
+
+Chunk sizes commonly tested are 256, 512, and 1024 tokens, each with an overlap of 50 tokens.
+
+=== SECTION 3: EMBEDDING MODELS ===
+
+Embedding models convert text chunks and queries into dense vector representations that
+capture semantic meaning, enabling similarity-based retrieval from vector databases.
+
+Popular embedding models used in RAG:
+- BGE (BAAI/bge-base-en-v1.5): State-of-the-art bilingual embeddings from BAAI.
+- E5 (intfloat/e5-base-v2): Efficient general-purpose embeddings optimised for retrieval.
+- Instructor (hkunlp/instructor-base): Instruction-tuned embeddings that accept task descriptions.
+- MiniLM (sentence-transformers/all-MiniLM-L6-v2): Lightweight and fast, good for real-time use.
+
+=== SECTION 4: VECTOR DATABASES ===
+
+Vector databases store embedding vectors and support fast approximate nearest-neighbour (ANN) search.
+The framework supports ChromaDB, FAISS, and Qdrant as vector database backends.
+
+ChromaDB is an open-source embedding database designed for LLM applications, with built-in
+metadata filtering and persistence.
+
+FAISS (Facebook AI Similarity Search) is a highly optimised C++ library for dense vector search,
+known for its speed and memory efficiency.
+
+Qdrant is a vector database with a rich filtering API, payloads, and support for named vectors.
+The framework uses Qdrant in in-memory mode for benchmarking.
+
+=== SECTION 5: RETRIEVAL STRATEGIES ===
+
+Basic RAG performs a direct vector similarity search against the vector database and returns
+the top-k most similar chunks.
+
+Reranking RAG adds a cross-encoder reranking step after initial vector retrieval. A cross-encoder
+model (cross-encoder/ms-marco-MiniLM-L-6-v2) scores each retrieved chunk against the query and
+reorders them for improved precision.
+
+Hybrid search combines keyword-based search (BM25) with dense vector search. BM25 captures
+exact lexical matches while vector search handles semantic similarity. Scores are fused using
+a weighted combination (default: 40% BM25, 60% vector).
+
+Multi-query retrieval generates multiple paraphrase versions of the original query using an LLM,
+retrieves documents for each, and merges the results to improve recall. This compensates for
+query ambiguity and vocabulary mismatch.
+
+=== SECTION 6: LOCAL LLM MODELS ===
+
+The framework supports Mistral, Qwen, and Llama 3.2 running locally via Ollama.
+
+Mistral is a 7B parameter model known for strong reasoning and instruction following in English
+and French. It balances speed and accuracy well.
+
+Qwen is Alibaba's multilingual model series with strong performance on both English and Chinese,
+and reasonable performance on French.
+
+Llama 3.2 is Meta's latest open-source model with improved instruction following and reasoning
+capabilities.
+
+=== SECTION 7: OCR ENGINES ===
+
+The framework supports Tesseract, EasyOCR, PaddleOCR, and DocTR for optical character recognition
+of scanned documents and images.
+
+Tesseract is the classic open-source OCR engine maintained by Google. It supports 100+ languages
+via LSTM-based recognition and is configured via tesseract language packs.
+
+EasyOCR is a Python-native OCR library based on deep learning that supports 80+ languages and
+works well out of the box without complex setup.
+
+PaddleOCR is developed by Baidu and offers high accuracy especially for complex layouts. It uses
+a detection + recognition pipeline.
+
+DocTR (Document Text Recognition) is developed by Mindee and uses end-to-end transformer-based
+architectures for document understanding.
+
+=== SECTION 8: EVALUATION METRICS ===
+
+Faithfulness measures whether all claims in the generated answer are actually supported by the
+retrieved context, quantifying hallucination. A faithfulness score of 1.0 means every claim
+in the answer is grounded in the context.
+
+Context precision measures the fraction of retrieved context chunks that are actually relevant
+to answering the question, reflecting the quality of the retrieval step.
+
+Context recall measures the fraction of ground-truth relevant information that is covered by the
+retrieved context chunks.
+
+Answer relevancy measures the semantic similarity between the generated answer and the original
+question, ensuring the answer is on-topic.
+
+Precision at K (P@K) measures the fraction of the top-K retrieved chunks that are relevant.
+
+Recall at K (R@K) measures the fraction of all relevant chunks that appear in the top-K results.
+
+Mean Reciprocal Rank (MRR) measures the rank of the first relevant chunk retrieved. Higher MRR
+indicates that the most relevant chunk tends to appear earlier in the result list.
+
+=== SECTION 9: EXPERIMENT FRAMEWORK ===
+
+The experiment runner creates a cartesian product of all enabled techniques across all pipeline
+stages. For each combination, it runs the full RAG pipeline end-to-end, evaluates the results
+against the ground-truth evaluation dataset, and stores all metrics in a SQLite database.
+
+Each experiment record includes: experiment_id, timestamp, ocr_engine, chunking_strategy,
+chunk_size, embedding_model, vector_db, retrieval_strategy, llm_model, and all metric scores.
+
+Results can be exported to CSV and visualised in the Streamlit dashboard.
+
+=== SECTION 10: DASHBOARD ===
+
+The Streamlit dashboard reads experiment results from the SQLite database and displays:
+- An interactive filterable experiment results table
+- Bar charts comparing model accuracy across techniques
+- Latency comparison charts
+- Retrieval metric radar charts
+- Auto-refresh every 30 seconds for live monitoring
+
+The dashboard uses pandas for data manipulation and Plotly for interactive visualisations.
