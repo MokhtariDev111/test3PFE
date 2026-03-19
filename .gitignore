@@ -21,8 +21,12 @@ Thumbs.db
 .idea/
 
 # ── Project data (may be large) ──────────────────────────────
-outputs/*
-logs/*
+outputs/*.pptx
+outputs/*.json
+logs/*.log
+data/raw/**
+data/processed/*.index
+data/processed/*.pkl
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/output/.gitkeep

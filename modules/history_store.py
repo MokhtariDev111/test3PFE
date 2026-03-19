@@ -7,6 +7,7 @@ Stored as a JSON array in outputs/presentation_history.json.
 
 import json
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -20,6 +21,7 @@ from modules.config_loader import CONFIG
 log = logging.getLogger("history_store")
 
 HISTORY_FILE = ROOT_DIR / CONFIG["paths"]["outputs"] / "presentation_history.json"
+_history_lock = threading.Lock()
 
 
 def _load() -> list[dict]:
@@ -43,6 +45,7 @@ def record_presentation(
     num_slides: int,
     theme_name: str,
     model: str,
+    slides: list = None
 ):
     """Append a presentation record to the history file."""
     p = Path(pptx_path)
@@ -55,23 +58,26 @@ def record_presentation(
         "theme":      theme_name,
         "model":      model,
         "filename":   p.name,
-        "filepath":   str(p),
         "size_kb":    round(p.stat().st_size / 1024, 1) if p.exists() else 0,
+        "slides":     slides or [],
     }
-    records = _load()
-    records.insert(0, entry)   # newest first
-    _save(records)
+    with _history_lock:
+        records = _load()
+        records.insert(0, entry)   # newest first
+        _save(records)
     log.info(f"History updated: {entry['filename']}")
     return entry
 
 
 def load_history() -> list[dict]:
     """Return all past presentation records, newest first."""
-    return _load()
+    with _history_lock:
+        return _load()
 
 
 def clear_history():
     """Delete all presentation history and the underlying JSON file."""
-    if HISTORY_FILE.exists():
-        HISTORY_FILE.unlink()
+    with _history_lock:
+        if HISTORY_FILE.exists():
+            HISTORY_FILE.unlink()
     log.info("History cleared.")

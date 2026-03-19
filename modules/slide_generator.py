@@ -26,10 +26,13 @@ if not log.hasHandlers():
 @dataclass
 class SlideData:
     """Single slide ready for PowerPoint export."""
-    slide_type:    str          # "title" | "content" | "section"
-    title:         str
-    bullets:       list[str] = field(default_factory=list)
-    speaker_notes: str = ""
+    slide_type:       str          # "title" | "content" | "section"
+    title:            str
+    bullets:          list[dict] = field(default_factory=list) # [{text: str, source_id: str}]
+    speaker_notes:    str = ""
+    image_id:         str = None
+    quality_score:    int = 10
+    quality_feedback: str = ""
 
 
 def build_slides(lesson: dict) -> list[SlideData]:
@@ -59,11 +62,18 @@ def build_slides(lesson: dict) -> list[SlideData]:
 
     # 2. Content slides
     for raw in raw_slides:
+        raw_bullets = raw.get("bullets", [])
+        if not isinstance(raw_bullets, list):
+            raw_bullets = [raw_bullets] if raw_bullets else []
+            
         output.append(SlideData(
             slide_type="content",
             title=raw.get("title", ""),
-            bullets=raw.get("bullets", []),
-            speaker_notes=raw.get("speaker_notes", "")
+            bullets=raw_bullets,
+            speaker_notes=raw.get("speaker_notes", ""),
+            image_id=raw.get("image_id"),
+            quality_score=raw.get("quality_score", 0),
+            quality_feedback=raw.get("quality_feedback", "")
         ))
 
     log.info(f"Generated {len(output)} slide(s) (1 title + {len(output)-1} content).")
@@ -89,9 +99,13 @@ if __name__ == "__main__":
 
     print(f"\n── {len(slides)} Slide(s) Generated ───────────────────────")
     for i, s in enumerate(slides, 1):
-        print(f"\n  [{s.slide_type.upper()}] Slide {i}: {s.title}")
+        print(f"\n  [{s.slide_type.upper()}] Slide {i}: {s.title} (Score: {s.quality_score}/10)")
         for b in s.bullets:
-            print(f"    • {b}")
+            txt = b.get("text", "") if isinstance(b, dict) else str(b)
+            src = b.get("source_id", "") if isinstance(b, dict) else ""
+            print(f"    • {txt} [{src}]")
         if s.speaker_notes:
             print(f"  Notes: {s.speaker_notes[:80]}...")
+        if s.quality_feedback:
+            print(f"  Feedback: {s.quality_feedback}")
     print("────────────────────────────────────────────────────────")

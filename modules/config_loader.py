@@ -25,6 +25,22 @@ def load_config(path: str | Path = CONFIG_PATH) -> dict:
 # Singleton — loaded once and reused across imports
 CONFIG: dict = load_config()
 
+import os
+# Allow environment variable overrides
+if os.getenv("OLLAMA_URL"):
+    CONFIG["llm"]["api_url"] = os.getenv("OLLAMA_URL")
+if os.getenv("OLLAMA_MODEL"):
+    CONFIG["llm"]["model"] = os.getenv("OLLAMA_MODEL")
+
+# Gracefully fallback device to CPU if CUDA is requested but unavailable
+dev = CONFIG.get("embeddings", {}).get("device", "cpu")
+if dev == "cuda":
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            CONFIG["embeddings"]["device"] = "cpu"
+    except ImportError:
+        CONFIG["embeddings"]["device"] = "cpu"
 
 if __name__ == "__main__":
     import json

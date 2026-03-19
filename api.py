@@ -17,6 +17,7 @@ CORS is open for dev; tighten the allowed_origins list for production.
 """
 
 import sys
+import os
 import logging
 import shutil
 import tempfile
@@ -29,7 +30,11 @@ sys.path.insert(0, str(ROOT_DIR))
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from typing import Optional
+
+# ── Constants ────────────────────────────────────────────────────────────────
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+MAX_PROMPT_LENGTH = 2000
+
 
 from modules.config_loader import CONFIG
 from modules.ingestion import ingest_directory
@@ -55,11 +60,24 @@ app = FastAPI(
     description="RAG-powered presentation generation API",
 )
 
-# CORS — allow all origins in development.
-# For production on Netlify, change "*" to your Netlify URL.
+# CORS — reads ALLOWED_ORIGINS env var.
+# Include common local dev origins so the browser doesn't block fetch() calls.
+# Example in production: ALLOWED_ORIGINS=https://your-app.netlify.app
+_default_allowed_origins = ",".join(
+    [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+    ]
+)
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", _default_allowed_origins).split(",")
+_allowed_origins = [o.strip() for o in _allowed_origins if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,6 +105,8 @@ def _slides_to_json(slides, diagrams: dict) -> list[dict]:
             "speakerNotes": s.speaker_notes or "",
             "diagram": mermaid_src,  # Mermaid syntax string or None
             "slideType": s.slide_type,
+            "qualityScore": getattr(s, "quality_score", 0),
+            "qualityFeedback": getattr(s, "quality_feedback", ""),
         })
     return result
 
@@ -96,6 +116,7 @@ def _slides_to_json(slides, diagrams: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 @app.post("/generate")
 async def generate(
+    background_tasks: BackgroundTasks,
     prompt: str = Form(...),
     theme: str = Form("Dark Navy"),
     num_slides: int = Form(5),
@@ -115,17 +136,33 @@ async def generate(
         "num_slides": N
       }
     """
+    # 0. Input validation
+    if not prompt or len(prompt) > MAX_PROMPT_LENGTH:
+        raise HTTPException(status_code=422, detail=f"Prompt must be 1-{MAX_PROMPT_LENGTH} characters")
+    if not (1 <= num_slides <= 15):
+        raise HTTPException(status_code=422, detail="num_slides must be between 1 and 15")
+    if theme not in THEMES:
+        theme = "Dark Navy"
+    language = language if language in ("English", "French") else "English"
+
     tmp_dir = Path(tempfile.mkdtemp())
     raw_dir = tmp_dir / "raw"
     raw_dir.mkdir()
 
     try:
-        # 1. Save uploaded files to temp dir
+        # 1. Save uploaded files to temp dir (with size and filename safety check)
         if files:
             for f in files:
-                dest = raw_dir / f.filename
-                with dest.open("wb") as out:
-                    shutil.copyfileobj(f.file, out)
+                content = await f.read()
+                if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File '{f.filename}' exceeds {MAX_FILE_SIZE_MB} MB limit"
+                    )
+                # Sanitize filename to prevent path traversal
+                safe_name = Path(f.filename).name.replace("..", "").replace("/", "").replace("\\", "")
+                dest = raw_dir / safe_name
+                dest.write_bytes(content)
         else:
             # Fall back to the project's default data directory
             src = ROOT_DIR / CONFIG["paths"]["data_raw"]
@@ -133,23 +170,33 @@ async def generate(
                 for p in src.iterdir():
                     shutil.copy(p, raw_dir / p.name)
 
-        # 2. Override model in config
-        CONFIG["llm"]["model"] = model
+        # 2. Use model locally without mutating the global CONFIG singleton
+        import copy
+        local_config_llm = copy.copy(CONFIG["llm"])
+        local_config_llm["model"] = model
 
         # 3. Run pipeline
         selected_theme = THEMES.get(theme, list(THEMES.values())[0])
 
         log.info("Ingesting documents …")
         pages = ingest_directory(raw_dir)
+        
+        # Extract raw embedded PDF images to supply to LLM context and PPTX exporter
+        pdf_images = {p.source: p.image for p in pages if p.type == "pdf_image" and isinstance(p.image, str)}
+        available_image_ids = list(pdf_images.keys())
+        
         pages = run_ocr(pages)
         chunks = process_pages(pages)
-        build_vector_db(chunks)
+        
+        # Isolate FAISS index for this specific request to avoid global state race conditions
+        isolated_index = tmp_dir / "faiss"
+        build_vector_db(chunks, index_path=isolated_index)
 
-        retriever = Retriever()
+        retriever = Retriever(index_path=isolated_index)
         results = retriever.search(prompt, top_k=top_k)
 
         engine = PedagogicalEngine()
-        lesson = engine.generate_lesson(prompt, results, num_slides=num_slides, language=language)
+        lesson = engine.generate_lesson(prompt, results, num_slides=num_slides, language=language, available_images=available_image_ids)
         topic = lesson.get("topic", prompt[:40])
 
         slides = build_slides(lesson)
@@ -165,7 +212,7 @@ async def generate(
 
         # Build PNG-only map for PPTX, Mermaid map for frontend
         png_map = {k: v["png"] for k, v in diag_map.items() if v.get("png")}
-        pptx_path = export_pptx(slides, theme=selected_theme, diagrams=png_map)
+        pptx_path = export_pptx(slides, theme=selected_theme, diagrams=png_map, pdf_images=pdf_images)
         log.info("PPTX saved to %s", pptx_path)
 
         # 4. Store path for download
@@ -173,22 +220,26 @@ async def generate(
         _pptx_store[pptx_id] = str(pptx_path)
 
         # 5. Record in history
-        record_presentation(pptx_path, prompt, topic, len(slides), theme, model)
+        json_slides = _slides_to_json(slides, diag_map)
+        record_presentation(pptx_path, prompt, topic, len(slides), theme, model, slides=json_slides)
 
         return {
-            "slides": _slides_to_json(slides, diag_map),
+            "slides": json_slides,
             "pptx_id": pptx_id,
             "topic": topic,
             "filename": Path(pptx_path).name,
             "num_slides": len(slides),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception("Pipeline error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Don't delete tmp_dir here — we still need the PPTX for download
-        pass
+        # Schedule temp dir cleanup (excluding the outputs dir where PPTX lives)
+        # The PPTX is saved to outputs/ (not tmp_dir), so it's safe to clean tmp
+        background_tasks.add_task(shutil.rmtree, tmp_dir, True)
 
 
 # ---------------------------------------------------------------------------

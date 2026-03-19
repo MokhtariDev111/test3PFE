@@ -8,7 +8,7 @@ Returns:  The path to the saved FAISS index and the chunk datastore.
 """
 
 import os
-import pickle
+import json
 import logging
 from pathlib import Path
 import numpy as np
@@ -32,10 +32,11 @@ if not log.hasHandlers():
 
 
 class VectorDB:
-    def __init__(self):
+    def __init__(self, index_path: str | Path = None):
         self.model_name = CONFIG["embeddings"]["model"]
         self.device = CONFIG["embeddings"]["device"]
-        self.index_path = Path(CONFIG["vector_db"]["index_path"])
+        # Use provided path (for isolated API requests) or fallback to global config
+        self.index_path = Path(index_path) if index_path else Path(CONFIG["vector_db"]["index_path"])
         
         self.model = None
         self.index = None
@@ -65,11 +66,36 @@ class VectorDB:
         embeddings = self.model.encode(texts, show_progress_bar=True, convert_to_numpy=True)
         # FAISS requires float32
         embeddings = np.array(embeddings).astype("float32")
+        faiss.normalize_L2(embeddings)
+        
+        # --- IDEA 7: Semantic Deduplication ---
+        # Calculate cosine similarity of all pairs (since vectors are normalized L2, dot product is cosine sim)
+        sim_matrix = np.dot(embeddings, embeddings.T)
+        
+        keep_indices = []
+        dropped_count = 0
+        for i in range(len(embeddings)):
+            if not keep_indices:
+                keep_indices.append(i)
+                continue
+                
+            # Check similarity against ALREADY KEPT chunks only
+            max_sim_to_kept = np.max(sim_matrix[i, keep_indices])
+            if max_sim_to_kept < 0.95:  # Threshold for deduplication
+                keep_indices.append(i)
+            else:
+                dropped_count += 1
+                
+        if dropped_count > 0:
+            log.info(f"Semantic Deduplication dropped {dropped_count} near-duplicate chunks.")
+            embeddings = embeddings[keep_indices]
+            chunks = [chunks[i] for i in keep_indices]
+        # --- End Idea 7 ---
         
         dimension = embeddings.shape[1]
         
-        # Create a simple flat (L2 distance) FAISS index
-        self.index = faiss.IndexFlatL2(dimension)
+        # Create an inner product (cosine similarity) FAISS index
+        self.index = faiss.IndexFlatIP(dimension)
         self.index.add(embeddings)
         
         self.chunks_store = chunks
@@ -83,18 +109,21 @@ class VectorDB:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         
         faiss_file = str(self.index_path.with_suffix(".index"))
-        store_file = str(self.index_path.with_suffix(".pkl"))
+        store_file = str(self.index_path.with_suffix(".json"))
         
         faiss.write_index(self.index, faiss_file)
-        with open(store_file, "wb") as f:
-            pickle.dump(self.chunks_store, f)
+        
+        # Serialize chunks using JSON (safe) instead of generic Pickle (insecure)
+        chunk_dicts = [c.__dict__ for c in self.chunks_store]
+        with open(store_file, "w", encoding="utf-8") as f:
+            json.dump(chunk_dicts, f, ensure_ascii=False)
             
         log.info(f"Saved Vector DB to '{self.index_path.parent}'.")
 
 
-def build_vector_db(chunks: list[TextChunk]):
+def build_vector_db(chunks: list[TextChunk], index_path: str | Path = None):
     """Wrapper function to perform Step 5 inside the pipeline."""
-    db = VectorDB()
+    db = VectorDB(index_path=index_path)
     db.embed_and_store(chunks)
 
 # ── Standalone test ───────────────────────────────────────────────────────────

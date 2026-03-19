@@ -8,6 +8,13 @@ from pathlib import Path
 from dataclasses import dataclass, field
 import fitz          # PyMuPDF
 from PIL import Image
+import base64
+import io
+import logging
+
+log = logging.getLogger("ingestion")
+if not log.hasHandlers():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
 
 PDF_EXT   = {".pdf"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
@@ -27,8 +34,14 @@ def load_txt(path: Path) -> DocumentPage:
     """Reads a plain text file."""
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read().strip()
-    print(f"  [TXT]  {path.name}  →  {len(text)} chars")
+    log.info(f"[TXT] {path.name}  →  {len(text)} chars")
     return DocumentPage(source=path.name, page=0, type="txt", text=text)
+
+
+def _pil_to_base64(img: Image.Image) -> str:
+    buffered = io.BytesIO()
+    img.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def load_pdf(path: Path) -> list[DocumentPage]:
@@ -51,37 +64,46 @@ def load_pdf(path: Path) -> list[DocumentPage]:
             if base_img:
                 from io import BytesIO
                 try:
-                    pil_img = Image.open(BytesIO(base_img["image"])).convert("RGB")
+                    pil_img = Image.open(io.BytesIO(base_img["image"])).convert("RGB")
+                    # Store as base64 instead of holding massive uncompressed PIL objects in RAM
+                    b64_img = _pil_to_base64(pil_img)
                     pages.append(
                         DocumentPage(
                             source=f"{path.name} (page {i+1} img {img_idx+1})", 
                             page=i + 1, 
-                            type="image", 
-                            image=pil_img
+                            type="pdf_image", 
+                            image=b64_img
                         )
                     )
                 except Exception as e:
-                    print(f"  [Warn] Failed to load image {img_idx} on page {i+1}: {e}")
+                    log.warning(f"Failed to load image {img_idx} on page {i+1}: {e}")
                     
     doc.close()
     
     img_count = sum(1 for p in pages if p.type == "image")
     txt_count = len(pages) - img_count
-    print(f"  [PDF]  {path.name}  →  {txt_count} text pg(s), {img_count} embedded img(s)")
+    log.info(f"[PDF] {path.name}  →  {txt_count} text pg(s), {img_count} embedded img(s)")
     return pages
 
 
 def load_image(path: Path) -> DocumentPage:
     img = Image.open(path).convert("RGB")
-    print(f"  [IMG]  {path.name}  →  {img.size[0]}×{img.size[1]} px")
-    return DocumentPage(source=path.name, page=0, type="image", image=img)
+    b64_img = _pil_to_base64(img)
+    log.info(f"[IMG] {path.name}  →  {img.size[0]}×{img.size[1]} px")
+    return DocumentPage(source=path.name, page=0, type="image", image=b64_img)
 
 
 def ingest_directory(raw_dir: str | Path) -> list[DocumentPage]:
     raw_dir = Path(raw_dir)
     results = []
-    files   = sorted(raw_dir.iterdir())
-    print(f"\nIngesting {len(files)} file(s) from '{raw_dir}' …")
+    
+    if not raw_dir.exists():
+        log.warning(f"Raw directory '{raw_dir}' does not exist.")
+        return results
+
+    files = sorted([f for f in raw_dir.iterdir() if f.is_file() and f.name != ".gitkeep"])
+    log.info(f"Ingesting {len(files)} file(s) from '{raw_dir}' …")
+    
     for f in files:
         ext = f.suffix.lower()
         if ext in PDF_EXT:
@@ -90,7 +112,8 @@ def ingest_directory(raw_dir: str | Path) -> list[DocumentPage]:
             results.append(load_image(f))
         elif ext in TXT_EXT:
             results.append(load_txt(f))
-    print(f"\nTotal pages/images loaded: {len(results)}\n")
+            
+    log.info(f"Total pages/images loaded: {len(results)}")
     return results
 
 

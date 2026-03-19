@@ -55,39 +55,42 @@ def clean_text(text: str) -> str:
 def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
     """
     Splits text into chunks of approximately `chunk_size` characters,
-    with `chunk_overlap` characters overlapping between chunks.
-    
-    This is a simple character-based sliding window approach.
-    For production, consider `langchain.text_splitter.RecursiveCharacterTextSplitter`.
+    with `chunk_overlap` characters overlapping between chunks, 
+    preferring to break on sentence boundaries.
     """
     if not text:
         return []
 
-    words = text.split()
+    # Simple regex to split on sentence endings (.!?)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     current_chunk = []
     current_length = 0
 
-    for word in words:
-        word_len = len(word) + 1  # +1 for the space
-        if current_length + word_len > chunk_size and current_chunk:
-            # Chunk is full, save it
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence: continue
+        
+        sentence_len = len(sentence) + 1  # +1 for space
+        
+        # If adding this sentence exceeds size and we have content, save it
+        if current_length + sentence_len > chunk_size and current_chunk:
             chunks.append(" ".join(current_chunk))
             
-            # Keep the last few words for overlap
-            overlap_words = []
+            # Backtrack to build overlap
+            overlap_sentences = []
             overlap_len = 0
-            for w in reversed(current_chunk):
-                if overlap_len + len(w) + 1 > chunk_overlap:
+            for s in reversed(current_chunk):
+                if overlap_len + len(s) + 1 > chunk_overlap:
                     break
-                overlap_words.insert(0, w)
-                overlap_len += len(w) + 1
+                overlap_sentences.insert(0, s)
+                overlap_len += len(s) + 1
             
-            current_chunk = overlap_words
+            current_chunk = overlap_sentences
             current_length = overlap_len
 
-        current_chunk.append(word)
-        current_length += word_len
+        current_chunk.append(sentence)
+        current_length += sentence_len
 
     if current_chunk:
         chunks.append(" ".join(current_chunk))

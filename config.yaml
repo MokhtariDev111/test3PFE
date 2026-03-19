@@ -15,8 +15,7 @@ paths:
   logs:           "logs"
   outputs:        "outputs"
 
-# Virtual environment (Python 3.11 with CUDA support)
-venv: "C:/stage PFE/PFE Project/test3/.venv311"
+# Virtual environment (managed automatically, path removed here)
 
 # ---- Step-specific settings (filled in as we progress) ----
 
@@ -33,7 +32,7 @@ text_processing:
 # Step 5 — Embeddings
 embeddings:
   model: "BAAI/bge-small-en-v1.5"   # small + fast, good quality
-  device: "cuda"                     # RTX 2060 — use GPU
+  device: "cuda"                     # Tries CUDA first, falls back to CPU automatically
 
 # Step 5 — Vector DB
 vector_db:

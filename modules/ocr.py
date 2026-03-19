@@ -63,7 +63,16 @@ class OCREngine:
             raise ValueError(f"Unknown OCR engine: {self.engine_type}")
 
     def process_image(self, pil_image) -> str:
-        """Runs the chosen OCR engine on a PIL Image and returns the extracted text."""
+        """Runs the chosen OCR engine on a PIL Image or base64 string and returns the extracted text."""
+        import base64
+        import io
+        from PIL import Image
+        
+        # If the image was passed as a base64 string from ingestion.py, decode it back to PIL
+        if isinstance(pil_image, str):
+            img_data = base64.b64decode(pil_image)
+            pil_image = Image.open(io.BytesIO(img_data)).convert("RGB")
+            
         if self.engine_type == "easyocr":
             # EasyOCR expects a numpy array
             img_np = np.array(pil_image)
@@ -83,18 +92,18 @@ def run_ocr(pages: list[DocumentPage]) -> list[DocumentPage]:
     Scans the list of DocumentPage objects.
     If a page is an image (or has no text but has an image object), runs OCR.
     """
-    needs_ocr = [p for p in pages if (p.type == "image" or not p.text) and p.image is not None]
+    needs_ocr = [p for p in pages if p.type == "image" and p.image is not None]
     
     if not needs_ocr:
-        log.info("No images/scans found. Skipping OCR.")
+        log.info("No standalone images found. Skipping OCR for speed optimization.")
         return pages
 
-    log.info(f"Found {len(needs_ocr)} page(s) requiring OCR.")
+    log.info(f"Found {len(needs_ocr)} standalone image(s) requiring OCR.")
     engine = OCREngine()
     
     processed = 0
     for page in pages:
-        if (page.type == "image" or not page.text) and page.image is not None:
+        if page.type == "image" and page.image is not None:
             text = engine.process_image(page.image)
             page.text = text.strip()
             processed += 1

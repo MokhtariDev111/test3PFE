@@ -7,7 +7,7 @@ Action:   Embeds the query using the same SentenceTransformer model,
 Returns:  list[TextChunk] containing the top `k` most relevant chunks.
 """
 
-import pickle
+import json
 import logging
 from pathlib import Path
 import numpy as np
@@ -31,10 +31,10 @@ if not log.hasHandlers():
 
 
 class Retriever:
-    def __init__(self):
+    def __init__(self, index_path: str | Path = None):
         self.model_name = CONFIG["embeddings"]["model"]
         self.device = CONFIG["embeddings"]["device"]
-        self.index_path = Path(CONFIG["vector_db"]["index_path"])
+        self.index_path = Path(index_path) if index_path else Path(CONFIG["vector_db"]["index_path"])
         
         self.model = None
         self.index = None
@@ -45,15 +45,16 @@ class Retriever:
     def _load_db(self):
         import faiss
         faiss_file = str(self.index_path.with_suffix(".index"))
-        store_file = str(self.index_path.with_suffix(".pkl"))
+        store_file = str(self.index_path.with_suffix(".json"))
         
         if not Path(faiss_file).exists() or not Path(store_file).exists():
             log.warning(f"Vector DB files not found at {self.index_path.parent}. Has Step 5 run?")
             return
             
         self.index = faiss.read_index(faiss_file)
-        with open(store_file, "rb") as f:
-            self.chunks_store = pickle.load(f)
+        with open(store_file, "r", encoding="utf-8") as f:
+            chunk_dicts = json.load(f)
+            self.chunks_store = [TextChunk(**d) for d in chunk_dicts]
             
         log.info(f"Loaded Vector DB mappings: {self.index.ntotal} vectors.")
 
@@ -75,7 +76,10 @@ class Retriever:
         query_vector = self.model.encode([query], convert_to_numpy=True)
         query_vector = np.array(query_vector).astype("float32")
         
-        # Search FAISS
+        import faiss
+        faiss.normalize_L2(query_vector)
+        
+        # Search FAISS (now uses dot product / cosine similarity)
         distances, indices = self.index.search(query_vector, top_k)
         
         results = []

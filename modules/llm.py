@@ -90,17 +90,17 @@ class LLMEngine:
         )
         
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=600) as response:
                 result = json.loads(response.read().decode("utf-8"))
                 return result.get("response", "").strip()
                 
         except URLError as e:
-            err_msg = f"Failed to connect to Ollama at {self.api_url}. Is Ollama running? Error: {e.reason}"
+            err_msg = f"Failed to connect to Ollama at {self.api_url}. Error: {e.reason}"
             log.error(err_msg)
-            return err_msg
+            raise RuntimeError(err_msg) from e
         except Exception as e:
             log.error(f"Unexpected error calling Ollama: {e}")
-            return str(e)
+            raise RuntimeError(f"Unexpected error: {e}") from e
 
 
 # ── Standalone test ───────────────────────────────────────────────────────────
