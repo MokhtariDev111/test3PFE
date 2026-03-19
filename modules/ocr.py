@@ -32,6 +32,8 @@ if not log.hasHandlers():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
 
 
+_EASYOCR_CACHE = None
+
 class OCREngine:
     def __init__(self):
         self.engine_type = CONFIG["ocr"]["engine"].lower()  # "easyocr" | "tesseract"
@@ -42,12 +44,15 @@ class OCREngine:
 
     def _initialize(self):
         """Loads the required OCR engine into memory."""
+        global _EASYOCR_CACHE
         if self.engine_type == "easyocr":
             try:
-                import easyocr
-                # GPU is automatically used if available via PyTorch
-                self._reader = easyocr.Reader(self.languages)
-                log.info("  ✔ EasyOCR loaded successfully.")
+                if _EASYOCR_CACHE is None:
+                    import easyocr
+                    # GPU is automatically used if available via PyTorch
+                    _EASYOCR_CACHE = easyocr.Reader(self.languages)
+                    log.info("  ✔ EasyOCR loaded successfully.")
+                self._reader = _EASYOCR_CACHE
             except ImportError:
                 log.error("EasyOCR not installed. Run: pip install easyocr")
                 raise

@@ -59,10 +59,12 @@ class Retriever:
         log.info(f"Loaded Vector DB mappings: {self.index.ntotal} vectors.")
 
     def _load_model(self):
-        if self.model is None:
+        import modules.embeddings
+        if modules.embeddings._GLOBAL_EMBED_MODEL is None:
             log.info(f"Loading embedding model for retrieval: '{self.model_name}'...")
             from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(self.model_name, device=self.device)
+            modules.embeddings._GLOBAL_EMBED_MODEL = SentenceTransformer(self.model_name, device=self.device)
+        self.model = modules.embeddings._GLOBAL_EMBED_MODEL
 
     def search(self, query: str, top_k: int = 5) -> list[TextChunk]:
         """Searches the FAISS index for the query."""

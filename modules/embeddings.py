@@ -31,6 +31,8 @@ if not log.hasHandlers():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
 
 
+_GLOBAL_EMBED_MODEL = None
+
 class VectorDB:
     def __init__(self, index_path: str | Path = None):
         self.model_name = CONFIG["embeddings"]["model"]
@@ -43,12 +45,14 @@ class VectorDB:
         self.chunks_store: list[TextChunk] = []
 
     def _load_model(self):
-        if self.model is None:
+        global _GLOBAL_EMBED_MODEL
+        if _GLOBAL_EMBED_MODEL is None:
             log.info(f"Loading embedding model '{self.model_name}' on {self.device}...")
             from sentence_transformers import SentenceTransformer
             # If CUDA is available, sentence-transformers will use it automatically via the device flag
-            self.model = SentenceTransformer(self.model_name, device=self.device)
+            _GLOBAL_EMBED_MODEL = SentenceTransformer(self.model_name, device=self.device)
             log.info("  ✔ Model loaded successfully.")
+        self.model = _GLOBAL_EMBED_MODEL
 
     def embed_and_store(self, chunks: list[TextChunk]):
         """Creates vectors for the chunks and builds the FAISS index."""

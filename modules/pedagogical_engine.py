@@ -89,10 +89,8 @@ JSON_INSTRUCTION = (
     "- LANGUAGE: Write ALL slide content in SLIDE_LANGUAGE.\n"
 
     # CONTENT QUALITY & ENGAGEMENT
-    "- Each slide must contain 3 to 5 HIGH-VALUE bullet points.\n"
-    "- Act like a world-class TED speaker and instructional designer.\n"
-    "- Use brilliant analogies, storytelling, and real-world examples to explain complex topics.\n"
-    "- Each bullet must be clear, specific, and impactful.\n"
+    "- Each slide must contain EXACTLY 3 concise bullet points.\n"
+    "- Act like a TED speaker. Keep text brief but highly impactful.\n"
 
     # CITATIONS
     "- For EVERY bullet, you MUST include a correct 'source_id'.\n"
@@ -100,12 +98,13 @@ JSON_INSTRUCTION = (
 
     # IMAGES & VISUALS
     "- You have access to raw images from the PDFs. They will be listed as 'AVAILABLE IMAGES'.\n"
-    "- If you see a highly relevant image ID, set 'image_id' to that EXACT string to feature it on the slide.\n"
+    "- If you see a highly relevant image ID (especially '(Full Page X Diagram)'), set 'image_id' to that EXACT string to feature it prominently on the slide.\n"
+    "- Favor showcasing diagrams/images over Mermaid code if a better diagram already exists natively in the PDF.\n"
     "- If no image fits, set 'image_id' to null.\n"
-    "- Also add a 'visual_hint' describing a diagram concept (even if you feature an image).\n"
+    "- Also add a short 'visual_hint' describing a diagram concept.\n"
 
     # TEACHING DEPTH
-    "- Speaker notes must be 3–5 sentences deep, highly engaging, and use vivid analogies.\n"
+    "- Speaker notes MUST be exactly 1 or 2 short sentences. Do not write long paragraphs.\n"
 
     # SELF-EVALUATION
     "- Assign a 'quality_score' (1–10) based on clarity, depth, and usefulness.\n"
@@ -129,6 +128,11 @@ class PedagogicalEngine:
                                    available_images: list[str] = None) -> str:
         """Builds a structured prompt requesting JSON lesson output."""
         context_text = "\n".join(f"[ID: {chunk.source} (page {chunk.page})] - {chunk.text}" for chunk in context_chunks)
+        
+        # CRITICAL OPTIMIZATION: Truncate massive context to speed up local LLM prompt evaluation vastly
+        if len(context_text) > 3000:
+            context_text = context_text[:3000] + "\n[Context Truncated for Speed...]"
+            
         lang_label = "French" if language.lower() in ("fr", "french", "français") else "English"
         instruction = (
             JSON_INSTRUCTION

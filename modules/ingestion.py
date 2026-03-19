@@ -57,7 +57,25 @@ def load_pdf(path: Path) -> list[DocumentPage]:
             DocumentPage(source=path.name, page=i + 1, type="pdf", text=text)
         )
         
-        # 2. Extract embedded images on this page
+        # Determine if this page is essentially a big visual diagram (sparse text, many vector shapes)
+        drawings = page.get_drawings()
+        if len(text) < 500 and len(drawings) > 2:
+            try:
+                # Render the vector diagram page as a crisp image
+                pix = page.get_pixmap(dpi=150)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                pages.append(
+                    DocumentPage(
+                        source=f"{path.name} (Full Page {i+1} Diagram)", 
+                        page=i + 1, 
+                        type="pdf_image", 
+                        image=_pil_to_base64(img)
+                    )
+                )
+            except Exception as e:
+                log.warning(f"Failed to extract Page {i+1} diagram from {path.name}: {e}")
+                
+        # 2. Extract embedded raster images on this page
         for img_idx, img_info in enumerate(page.get_images(full=True)):
             xref = img_info[0]
             base_img = doc.extract_image(xref)

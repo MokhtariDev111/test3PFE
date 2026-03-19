@@ -126,9 +126,16 @@ def _add_rect(slide, left, top, width, height, fill_color: RGBColor):
     return shape
 
 
+def _add_transition(slide):
+    from pptx.oxml import parse_xml
+    # Inject smooth fade transition for more "life" and impressiveness
+    transition_xml = '<p:transition xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" spd="med"><p:fade/></p:transition>'
+    slide.element.insert(-1, parse_xml(transition_xml))
+
 # ── Slide Builders ────────────────────────────────────────────────────────────
 def build_title_slide(prs: Presentation, slide_data: SlideData, theme: ThemeConfig):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_transition(slide)
     _set_bg(slide, theme.bg)
     W = prs.slide_width
     H = prs.slide_height
@@ -150,6 +157,7 @@ def build_title_slide(prs: Presentation, slide_data: SlideData, theme: ThemeConf
 def build_content_slide(prs: Presentation, slide_data: SlideData,
                         theme: ThemeConfig, diagram_path: str = None, pdf_images: dict = None):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _add_transition(slide)
     _set_bg(slide, theme.bg)
     W = prs.slide_width
     H = prs.slide_height
@@ -189,10 +197,12 @@ def build_content_slide(prs: Presentation, slide_data: SlideData,
             _add_textbox(slide, f"▸  {txt}",
                          left=Inches(0.4), top=Inches(1.3 + i * 0.82), width=text_width, height=Inches(0.75),
                          font_size=16, bold=False, color=theme.bullet)
-        # Image on the right (width constrained to 3.8 inches to maintain aspect ratio)
-        slide.shapes.add_picture(visual_stream,
-                                 left=Inches(5.8), top=Inches(1.2),
-                                 width=Inches(3.8))
+        # Image on the right (width constrained to maintain aspect ratio)
+        pic = slide.shapes.add_picture(visual_stream,
+                                       left=Inches(5.8), top=Inches(1.2),
+                                       width=Inches(3.8))
+        # Add subtle shadow for more elegance
+        pic.shadow.inherit = True
     else:
         for i, bullet in enumerate(bullets_to_render):
             txt = bullet.get("text", "") if isinstance(bullet, dict) else str(bullet)
