@@ -41,8 +41,9 @@ def warm_ocr_engine():
         try:
             import easyocr
             langs = CONFIG["ocr"]["languages"]
-            log.info(f"Pre-warming EasyOCR ({langs})...")
-            _EASYOCR_CACHE = easyocr.Reader(langs)
+            device = CONFIG["ocr"].get("device", "cpu")  # NEW: respect device config
+            log.info(f"Pre-warming EasyOCR ({langs}) on {device}...")
+            _EASYOCR_CACHE = easyocr.Reader(langs, gpu=(device == "cuda"))
             log.info("  ✔ EasyOCR pre-warmed successfully.")
         except ImportError:
             log.warning("EasyOCR not installed — skipping pre-warm.")
@@ -63,8 +64,9 @@ class OCREngine:
             try:
                 if _EASYOCR_CACHE is None:
                     import easyocr
-                    _EASYOCR_CACHE = easyocr.Reader(self.languages)
-                    log.info("  ✔ EasyOCR loaded.")
+                    device = CONFIG["ocr"].get("device", "cpu")
+                    _EASYOCR_CACHE = easyocr.Reader(self.languages, gpu=(device == "cuda"))
+                    log.info(f"  ✔ EasyOCR loaded on {device}.")
                 self._reader = _EASYOCR_CACHE
             except ImportError:
                 log.error("EasyOCR not installed.")

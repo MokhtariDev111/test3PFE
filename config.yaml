@@ -1,28 +1,25 @@
 # ============================================================
-# Real-Time AI Teaching Assistant — Central Configuration
+# TEKUP AI Teaching Assistant — Central Configuration
 # ============================================================
 
 project:
   name: "TEKUP AI Teaching Assistant"
-  version: "1.0.0"
-  description: "Automatic PowerPoint generation using RAG"
+  version: "2.0.0"
+  description: "RAG-powered presentation generation with hybrid retrieval"
 
 # Paths
 paths:
-  data_raw:       "data/raw"          # Drop your PDFs / images here
-  data_processed: "data/processed"   # Cleaned & chunked text
-  data_output:    "data/output"      # Generated slides / PPTX
+  data_raw:       "data/raw"
+  data_processed: "data/processed"
+  data_output:    "data/output"
   logs:           "logs"
   outputs:        "outputs"
-
-# Virtual environment (managed automatically, path removed here)
-
-# ---- Step-specific settings (filled in as we progress) ----
 
 # Step 3 — OCR
 ocr:
   engine: "easyocr"          # "easyocr" | "tesseract"
   languages: ["fr", "en"]
+  device: "cpu"              # NEW: force OCR to CPU to free GPU for Ollama
 
 # Step 4 — Text Processing
 text_processing:
@@ -31,28 +28,60 @@ text_processing:
 
 # Step 5 — Embeddings
 embeddings:
-  model: "BAAI/bge-small-en-v1.5"   # small + fast, good quality
-  device: "cuda"                     # Tries CUDA first, falls back to CPU automatically
+  model: "BAAI/bge-small-en-v1.5"
+  device: "cpu"              # CHANGED: use CPU to free GPU for Ollama (embedding is fast enough on CPU)
 
 # Step 5 — Vector DB
 vector_db:
-  backend: "faiss"                  # "faiss" | "chroma"
+  backend: "faiss"
   index_path: "data/processed/faiss_index"
 
-# Step 7 — LLM  (Ollama Backend)
-llm:
-  backend: "ollama"            
-  api_url: "http://localhost:11434/api/generate"
-  
-  # Change this to whatever you specifically have installed via Ollama
-  # Examples: "mistral", "llama3.2", "qwen2.5"
-  model: "mistral"
-  
-  # Generation parameters
-  temperature: 0.7
-  context_length: 2048
+# ── NEW: Retrieval settings ──────────────────────────────────────────────────
+retrieval:
+  # Hybrid search: combines FAISS (semantic) + BM25 (keyword) via RRF
+  use_bm25: true             # set false to use dense-only (old behaviour)
+  bm25_weight: 0.5           # 0.0 = dense only, 1.0 = BM25 only (RRF makes this soft)
 
-# Step 11 — Streamlit
+  # Cross-encoder reranker — runs on top-N candidates after hybrid search
+  use_reranker: false        # CHANGED: disabled to save GPU memory (reranker uses ~280MB VRAM)
+  reranker_model: "BAAI/bge-reranker-base"
+  reranker_top_n: 20
+
+# Step 7 — LLM (Ollama Backend)
+llm:
+  backend: "ollama"
+  api_url: "http://127.0.0.1:11434/api/generate"
+  model: "mistral:latest"
+  temperature: 0.7
+  context_length: 2048       # Reduced from 3072 to save VRAM
+
+  # ── NEW: Judge model ────────────────────────────────────────────────────────
+  # Used for the LLM-as-judge call that validates slide quality.
+  # Set to the same as `model` to use one model for everything (cheaper).
+  # Set to a stronger model (e.g. "llama3:8b") for better quality filtering.
+  judge_model: "mistral:latest"
+  judge_enabled: false       # CHANGED: disabled to reduce LLM calls and save time
+
+# ── NEW: Generation settings ─────────────────────────────────────────────────
+generation:
+  # Minimum quality_score (1–10) for a slide to be accepted.
+  # Slides scoring below this are retried with quality_feedback injected.
+  quality_threshold: 5
+
+  # Generate all slides concurrently instead of one at a time.
+  # Reduces wait time from (N × LLM latency) to (~1 × LLM latency).
+  # CHANGED: disabled for 6GB VRAM — parallel calls cause OOM
+  parallel: false
+
+# ── PDF image extraction (for slide embedding) ───────────────────────────────
+# When true, extracts embedded images from PDFs and offers them to the LLM
+# to include in slides when content matches. Set false to skip extraction (faster).
+pdf_images:
+  extract: true
+  # Max images to extract per PDF (first N pages with images)
+  max_per_doc: 20
+
+# Step 11 — Streamlit (legacy)
 streamlit:
   port: 8501
   title: "AI Teaching Assistant"

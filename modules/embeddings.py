@@ -1,8 +1,11 @@
 """
-embeddings.py  —  Step 5: Embeddings & Vector DB
-FIX C: Cache FAISS index by SHA-256 hash of input chunk texts.
-       If the same files are submitted again, skip rebuilding entirely
-       — saves 5–15s per repeat request.
+embeddings.py — v2: saves BM25 tokenized corpus alongside FAISS index
+======================================================================
+Changes from v1:
+  1. After building the FAISS index, saves a tokenized BM25 corpus to
+     <index_path>.bm25.json so retrieval.py can load it without re-processing.
+  2. SHA-256 cache and semantic deduplication unchanged.
+  3. All existing API (build_vector_db, VectorDB) unchanged — no breaking changes.
 """
 
 import hashlib
@@ -16,27 +19,23 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-try:
-    from modules.text_processing import TextChunk
-except ImportError:
-    pass
-
 from modules.config_loader import CONFIG
 
 log = logging.getLogger("embeddings")
 if not log.hasHandlers():
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-                        datefmt="%H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
 _GLOBAL_EMBED_MODEL = None
 
-# FIX C: in-process index cache  { content_hash: (faiss_index, chunks_list) }
+# In-process index cache  { content_hash: (faiss_index, chunks_list) }
 _INDEX_CACHE: dict = {}
 
 
 def _chunks_hash(chunks: list) -> str:
-    """Stable SHA-256 fingerprint of chunk texts — used as cache key."""
     h = hashlib.sha256()
     for c in chunks:
         h.update(c.text.encode("utf-8"))
@@ -68,14 +67,13 @@ class VectorDB:
 
         import faiss
 
-        # FIX C: check cache first
+        # Cache check
         key = _chunks_hash(chunks)
         if key in _INDEX_CACHE:
-            log.info("  ✔ FAISS index cache HIT — skipping rebuild (saves 5–15s).")
+            log.info("  ✔ FAISS index cache HIT — skipping rebuild.")
             cached_index, cached_chunks = _INDEX_CACHE[key]
             self.index        = cached_index
             self.chunks_store = cached_chunks
-            # Only write to disk if the index file doesn't already exist
             if not self.index_path.with_suffix(".index").exists():
                 self._save_to_disk()
             return
@@ -84,12 +82,11 @@ class VectorDB:
         self._load_model()
 
         texts      = [c.text for c in chunks]
-        embeddings = self.model.encode(texts, show_progress_bar=False,
-                                       convert_to_numpy=True)
+        embeddings = self.model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
         embeddings = np.array(embeddings).astype("float32")
         faiss.normalize_L2(embeddings)
 
-        # Semantic deduplication (kept, but skip O(n²) for large sets)
+        # Semantic deduplication (skip O(n²) for large sets)
         if len(embeddings) <= 500:
             sim_matrix   = np.dot(embeddings, embeddings.T)
             keep_indices = []
@@ -105,12 +102,11 @@ class VectorDB:
                 embeddings = embeddings[keep_indices]
                 chunks     = [chunks[i] for i in keep_indices]
 
-        dim         = embeddings.shape[1]
-        self.index  = faiss.IndexFlatIP(dim)
+        dim        = embeddings.shape[1]
+        self.index = faiss.IndexFlatIP(dim)
         self.index.add(embeddings)
         self.chunks_store = chunks
 
-        # Store in cache
         _INDEX_CACHE[key] = (self.index, self.chunks_store)
         log.info(f"  ✔ FAISS index built ({self.index.ntotal} vectors) and cached.")
         self._save_to_disk()
@@ -118,11 +114,24 @@ class VectorDB:
     def _save_to_disk(self):
         import faiss
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Save FAISS binary index
         faiss.write_index(self.index, str(self.index_path.with_suffix(".index")))
+
+        # Save chunk metadata (text + source + page)
         chunk_dicts = [c.__dict__ for c in self.chunks_store]
         with open(self.index_path.with_suffix(".json"), "w", encoding="utf-8") as f:
             json.dump(chunk_dicts, f, ensure_ascii=False)
-        log.info(f"  Saved Vector DB to '{self.index_path.parent}'.")
+
+        # NEW: Save BM25 tokenized corpus so retrieval.py can build BM25 without
+        # re-loading the embedding model or re-reading the original text.
+        # Each entry is a list of lowercase tokens from the chunk text.
+        bm25_corpus = [c.text.lower().split() for c in self.chunks_store]
+        bm25_path   = self.index_path.with_suffix(".bm25.json")
+        with open(bm25_path, "w", encoding="utf-8") as f:
+            json.dump(bm25_corpus, f, ensure_ascii=False)
+
+        log.info(f"  Saved Vector DB (FAISS + BM25 corpus) to '{self.index_path.parent}'.")
 
 
 def build_vector_db(chunks: list, index_path=None):

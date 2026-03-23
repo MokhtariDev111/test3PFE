@@ -360,15 +360,15 @@ def build_content_slide(prs, slide_data, theme: ThemeConfig,
                          diagram_path: str = None, pdf_images: dict = None):
     pdf_images = pdf_images or {}
 
-    # Determine visual stream (FIX 5: seek(0) before use)
+    # Determine visual stream (Prioritize PDF images over diagrams)
     visual_stream = None
-    if diagram_path and Path(diagram_path).exists():
-        visual_stream = diagram_path
-    elif getattr(slide_data, 'image_id', None) and slide_data.image_id in pdf_images:
+    if getattr(slide_data, 'image_id', None) and slide_data.image_id in pdf_images:
         img_data = base64.b64decode(pdf_images[slide_data.image_id])
         buf = io.BytesIO(img_data)
-        buf.seek(0)          # FIX 5
+        buf.seek(0)
         visual_stream = buf
+    elif diagram_path and Path(diagram_path).exists():
+        visual_stream = diagram_path
 
     has_visual  = visual_stream is not None
     bullets     = slide_data.bullets or []
