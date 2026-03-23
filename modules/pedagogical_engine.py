@@ -1,20 +1,10 @@
 """
-pedagogical_engine.py  —  Step 8: Pedagogical Engine
-====================================================
-Receives: A user query and retrieved TextChunks (from Step 6).
-Action:   Uses the LLM to produce a STRUCTURED JSON lesson plan
-          instead of a raw text answer. The schema is:
-          {
-            "topic": "...",
-            "slides": [
-              {
-                "title": "...",
-                "bullets": ["...", "..."],
-                "speaker_notes": "..."
-              }
-            ]
-          }
-Returns:  A validated Python dict matching the JSON schema above.
+pedagogical_engine.py — v4: Batched generation
+================================================
+Instead of asking Mistral to generate all N slides at once
+(which causes truncation), generates in batches of 2 slides
+and merges the results. Each batch call is small enough to
+complete fully within the context window.
 """
 
 import json
@@ -22,6 +12,7 @@ import logging
 import re
 from pathlib import Path
 import sys
+import hashlib
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -37,187 +28,341 @@ from modules.llm import LLMEngine
 
 log = logging.getLogger("pedagogical_engine")
 if not log.hasHandlers():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+                        datefmt="%H:%M:%S")
+
+# Slide types to use in order for a good pedagogical arc
+SLIDE_ARC = ["definition", "concept", "concept", "example", "comparison",
+             "example", "summary", "concept", "comparison", "definition",
+             "example", "summary", "concept", "comparison", "summary"]
+
+# Minimal schema for ONE slide
+_ONE_SLIDE_SCHEMA = '''{
+  "slide_type": "concept",
+  "title": "Slide Title Here",
+  "bullets": [
+    {"text": "Specific fact or mechanism with a concrete detail", "source_id": "source or General Knowledge"},
+    {"text": "Second distinct point — no overlap with bullet 1", "source_id": "source or General Knowledge"},
+    {"text": "Third point — real example or implication", "source_id": "source or General Knowledge"}
+  ],
+  "key_message": "One-sentence synthesis NOT present in the bullets",
+  "visual_hint": "flowchart",
+  "image_id": null,
+  "speaker_notes": "One or two short sentences.",
+  "quality_score": 8,
+  "quality_feedback": "Brief reason."
+}'''
 
 
-LESSON_SCHEMA = {
-    "topic": "string — short filename-friendly topic (English)",
-    "slides": [
-        {
-            "title": "string — clear, engaging slide title",
+def _build_single_slide_prompt(
+    query: str,
+    context_text: str,
+    slide_type: str,
+    slide_number: int,
+    total: int,
+    language: str,
+    prior_titles: list[str],
+    prior_hints: list[str] = None,
+) -> str:
+    prior = "\n".join(f"- {t}" for t in prior_titles[-6:]) if prior_titles else "(none)"
+    used_hints = ", ".join(prior_hints[-4:]) if prior_hints else "(none)"
+    # Suggest a hint that hasn't been used recently
+    all_hints = ["flowchart", "mindmap", "timeline", "comparison", "process", "hierarchy"]
+    suggested_hint = next((h for h in all_hints if not prior_hints or h not in prior_hints[-3:]), all_hints[slide_number % len(all_hints)])
+    return f"""You are an expert AI teaching assistant. Output ONLY a valid JSON object for ONE slide. No text before or after the JSON.
 
-            "bullets": [
-                {
-                    "text": "string — concise but informative key point",
-                    "source_id": "string — EXACT source ID or 'General Knowledge'"
-                }
-            ],
+Generate slide {slide_number} of {total} about: {query}
+Slide type: {slide_type}
+Language: {language}
 
-            "key_message": "string — the ONE main takeaway of the slide",
+JSON schema:
+{_ONE_SLIDE_SCHEMA}
 
-            "visual_hint": "string — what visual should be shown (diagram, flowchart, timeline, comparison, etc.)",
-            
-            "image_id": "string or null — the EXACT source ID of an available PDF image to feature, otherwise null",
+Rules:
+1. slide_type must be: {slide_type}
+2. bullets: exactly 3. Each must contain a specific fact, number, or mechanism. Never vague.
+3. key_message: one sentence synthesis — must NOT repeat bullet text.
+4. visual_hint: MUST be different from recently used hints ({used_hints}). Suggested: "{suggested_hint}". Choose from: flowchart, mindmap, timeline, comparison, process, hierarchy, none
+5. speaker_notes: 1-2 short sentences only.
+6. All content in {language}.
+7. source_id: exact document source or "General Knowledge".
+8. Start with {{ and end with }}. No markdown.
+9. Do NOT repeat previous slide titles or bullets. Each slide must introduce new information.
 
-            "speaker_notes": "string — 3-5 sentence deep explanation for the teacher, using analogies",
+Previous slide titles (avoid repeating):
+{prior}
 
-            "quality_score": 0,
-            "quality_feedback": "string — short justification (clarity, depth, accuracy)"
-        }
-    ]
+Context:
+{context_text}
+
+Topic: {query}
+
+JSON:"""
+
+
+def _repair_json(raw: str) -> str:
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
+    raw = re.sub(r"```$", "", raw).strip()
+    raw = raw.replace(": None", ": null").replace(":None", ": null")
+    raw = raw.replace(": True", ": true").replace(": False", ": false")
+    # Remove trailing commas before } or ]
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+    # Strip prose before {
+    brace_start = raw.find("{")
+    if brace_start > 0:
+        raw = raw[brace_start:]
+    # Strip prose after }
+    brace_end = raw.rfind("}")
+    if brace_end != -1 and brace_end < len(raw) - 1:
+        raw = raw[:brace_end + 1]
+    return raw
+
+
+def _extract_slide_json(raw: str) -> dict | None:
+    log.warning(f"Raw slide output ({len(raw)} chars): {raw[:400]!r}")
+    if not raw or not raw.strip():
+        return None
+    repaired = _repair_json(raw)
+    try:
+        obj = json.loads(repaired)
+        if "title" in obj and "bullets" in obj:
+            return obj
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", repaired, re.DOTALL)
+    if match:
+        try:
+            obj = json.loads(match.group())
+            if "title" in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
+    log.error(f"Could not extract slide JSON from: {raw[:200]!r}")
+    return None
+
+
+def _extract_topic(raw: str, fallback: str) -> str:
+    """Try to extract topic from first slide output."""
+    match = re.search(r'"topic"\s*:\s*"([^"]+)"', raw)
+    return match.group(1) if match else fallback
+
+
+def _norm_title(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _slide_fingerprint(slide: dict) -> str:
+    """Stable-ish fingerprint to catch near-identical repeats."""
+    title = _norm_title(slide.get("title", ""))
+    bullets = slide.get("bullets", [])
+    if not isinstance(bullets, list):
+        bullets = [bullets] if bullets else []
+    btxt = []
+    for b in bullets:
+        if isinstance(b, str):
+            btxt.append(b.strip().lower())
+        elif isinstance(b, dict):
+            btxt.append(str(b.get("text", "")).strip().lower())
+        else:
+            btxt.append(str(b).strip().lower())
+    key = title + "|" + "|".join(btxt[:3])
+    return hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+
+
+
+# Sub-query templates per slide type to drive per-slide retrieval
+_SLIDE_TYPE_SUBQUERY = {
+    "definition":  "definition and meaning of {query}",
+    "concept":     "key concepts and principles of {query}",
+    "example":     "real-world examples and applications of {query}",
+    "comparison":  "comparison and differences related to {query}",
+    "summary":     "summary and main takeaways of {query}",
 }
 
-JSON_INSTRUCTION = (
-    "You are an expert AI Teaching Assistant, instructional designer, and presentation expert.\n"
-    "Your goal is to create a HIGH-QUALITY, ENGAGING, and PEDAGOGICALLY EFFECTIVE lesson.\n\n"
 
-    "Output ONLY valid JSON matching this exact schema (no markdown, no prose):\n"
-    + json.dumps(LESSON_SCHEMA, indent=2)
-    + "\n\n"
-
-    "STRICT RULES:\n"
-
-    # STRUCTURE
-    "- Generate exactly NUM_SLIDES slides.\n"
-    "- Follow a LOGICAL TEACHING FLOW:\n"
-    "  1. Introduction (what & why it matters)\n"
-    "  2. Core concepts\n"
-    "  3. Examples / applications\n"
-    "  4. Key insights / summary\n"
-
-    # LANGUAGE
-    "- LANGUAGE: Write ALL slide content in SLIDE_LANGUAGE.\n"
-
-    # CONTENT QUALITY & ENGAGEMENT
-    "- Each slide must contain EXACTLY 3 concise bullet points.\n"
-    "- Act like a TED speaker. Keep text brief but highly impactful.\n"
-
-    # CITATIONS
-    "- For EVERY bullet, you MUST include a correct 'source_id'.\n"
-    "- Use EXACT source IDs from context or 'General Knowledge'.\n"
-
-    # IMAGES & VISUALS
-    "- You have access to raw images from the PDFs. They will be listed as 'AVAILABLE IMAGES'.\n"
-    "- If you see a highly relevant image ID (especially '(Full Page X Diagram)'), set 'image_id' to that EXACT string to feature it prominently on the slide.\n"
-    "- Favor showcasing diagrams/images over Mermaid code if a better diagram already exists natively in the PDF.\n"
-    "- If no image fits, set 'image_id' to null.\n"
-    "- Also add a short 'visual_hint' describing a diagram concept.\n"
-
-    # TEACHING DEPTH
-    "- Speaker notes MUST be exactly 1 or 2 short sentences. Do not write long paragraphs.\n"
-
-    # SELF-EVALUATION
-    "- Assign a 'quality_score' (1–10) based on clarity, depth, and usefulness.\n"
-    "- Provide a 1-sentence 'quality_feedback'.\n"
-    "- A score below 7 is NOT acceptable.\n"
-
-    # TOPIC
-    "- The 'topic' must be short (max 4–5 words), in English, filename-friendly.\n"
-
-    # FINAL CONSTRAINT
-    "- DO NOT output anything outside the JSON.\n"
-)
+def _subquery_for_slide(query: str, slide_type: str, slide_number: int, prior_titles: list[str]) -> str:
+    """Build a focused retrieval sub-query for a specific slide."""
+    template = _SLIDE_TYPE_SUBQUERY.get(slide_type, "{query}")
+    base = template.format(query=query)
+    # After a few slides, steer away from already-covered titles
+    if prior_titles:
+        covered = ", ".join(prior_titles[-3:])
+        base += f" (excluding: {covered})"
+    return base
 
 
 class PedagogicalEngine:
-    def __init__(self):
+    def __init__(self, retriever=None):
         self.llm = LLMEngine()
+        self.retriever = retriever  # optional: injected from api.py for per-slide retrieval
 
-    def _build_pedagogical_prompt(self, query: str, context_chunks: list[TextChunk],
-                                   num_slides: int = 3, language: str = "English",
-                                   available_images: list[str] = None) -> str:
-        """Builds a structured prompt requesting JSON lesson output."""
-        context_text = "\n".join(f"[ID: {chunk.source} (page {chunk.page})] - {chunk.text}" for chunk in context_chunks)
-        
-        # CRITICAL OPTIMIZATION: Truncate massive context to speed up local LLM prompt evaluation vastly
-        if len(context_text) > 3000:
-            context_text = context_text[:3000] + "\n[Context Truncated for Speed...]"
-            
-        lang_label = "French" if language.lower() in ("fr", "french", "français") else "English"
-        instruction = (
-            JSON_INSTRUCTION
-            .replace("NUM_SLIDES", str(num_slides))
-            .replace("SLIDE_LANGUAGE", lang_label)
+    def _prepare_context(self, context_chunks: list, max_chars: int = 2400) -> str:
+        # Deduplicate chunks by text to avoid feeding the same passage twice
+        seen = set()
+        unique_chunks = []
+        for c in context_chunks:
+            key = c.text.strip()[:120]
+            if key not in seen:
+                seen.add(key)
+                unique_chunks.append(c)
+
+        context_text = "\n".join(
+            f"[Source: {c.source} p{c.page}] {c.text}"
+            for c in unique_chunks
         )
-        
-        images_text = "AVAILABLE IMAGES:\n" + ("\n".join(f"- {img}" for img in available_images) if available_images else "None")
+        if len(context_text) > max_chars:
+            context_text = context_text[:max_chars] + "\n[truncated]"
+        return context_text
 
-        return (
-            f"{instruction}\n\n"
-            "=== CONTEXT FROM DOCUMENTS ===\n"
-            f"{context_text}\n"
-            "=== END CONTEXT ===\n\n"
-            f"{images_text}\n\n"
-            f"USER TOPIC / QUESTION: {query}\n\n"
-            "JSON LESSON PLAN:"
-        )
-
-    def _extract_json(self, raw: str) -> dict:
-        """Tries to extract a valid JSON object from the model output."""
-        # Strip any markdown fences if the model added them anyway
-        raw = re.sub(r"```(?:json)?", "", raw).strip()
-
-        # Some local LLMs hallucinate Python syntax instead of strict JSON
-        raw = raw.replace('"image_id": None', '"image_id": null')
-        raw = raw.replace(': None', ': null')
-        raw = raw.replace(': False', ': false')
-        raw = raw.replace(': True', ': true')
-
-        # Try to find the JSON object using braces
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-
-        # Fall back: try parsing the whole string
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as e:
-            log.warning(f"Could not parse JSON from LLM output: {e}\nRaw output snippet: {raw[:300]}")
-            return {"topic": "Unknown", "slides": [], "_raw": raw}
-
-    def generate_lesson(self, query: str, context_chunks: list[TextChunk],
-                        num_slides: int = 3, language: str = "English",
-                        available_images: list[str] = None) -> dict:
-        """Main entry point for Step 8: produces a structured JSON lesson."""
+    async def generate_lesson_async(self, query: str, context_chunks: list,
+                                    num_slides: int = 5, language: str = "English",
+                                    available_images: list = None) -> dict:
         if not context_chunks:
             return {"topic": query, "slides": [], "_error": "No context retrieved."}
 
-        prompt = self._build_pedagogical_prompt(query, context_chunks,
-                                                num_slides=num_slides, language=language,
-                                                available_images=available_images)
-        log.info(f"Requesting lesson plan for: '{query}' ({num_slides} slides, lang={language})...")
+        lang_label   = "French" if language.lower() in ("fr", "french", "français") else "English"
+        slides       = []
+        topic        = query[:40]
+        prior_titles: list[str] = []
+        prior_fps: set[str] = set()
+        prior_hints: list[str] = []
 
-        raw_output = self.llm.generate(query, context_chunks, prompt_override=prompt)
+        log.info(f"Generating {num_slides} slides one-by-one for: '{query}'")
 
-        lesson = self._extract_json(raw_output)
-        log.info(f"Lesson plan created: {len(lesson.get('slides', []))} slide(s).")
-        return lesson
+        for i in range(num_slides):
+            slide_type = SLIDE_ARC[i % len(SLIDE_ARC)]
 
-
-# ── Standalone test ─────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    from modules.retrieval import Retriever
-
-    query = "Explain the Transformer attention mechanism"
-    print(f"\n[Step 6] Retrieving context for: '{query}'...")
-    retriever = Retriever()
-    chunks = retriever.search(query, top_k=4)
-
-    print("\n[Step 8] Generating pedagogical lesson plan...")
-    engine = PedagogicalEngine()
-    lesson = engine.generate_lesson(query, chunks)
-
-    print("\n── Lesson Plan ──────────────────────────────")
-    print(f"Topic: {lesson.get('topic', 'N/A')}")
-    for i, slide in enumerate(lesson.get("slides", []), 1):
-        print(f"\n  Slide {i}: {slide.get('title', '')} [Score: {slide.get('quality_score', '?')}/10]")
-        for b in slide.get("bullets", []):
-            if isinstance(b, dict):
-                print(f"    • {b.get('text', '')} (Source: {b.get('source_id', '')})")
+            # Per-slide retrieval: fetch chunks relevant to this specific slide type
+            if self.retriever is not None:
+                sub_q = _subquery_for_slide(query, slide_type, i + 1, prior_titles)
+                slide_chunks = self.retriever.search(sub_q, top_k=5)
+                # Fall back to original chunks if retrieval returns nothing
+                if not slide_chunks:
+                    slide_chunks = context_chunks
+                log.info(f"  Slide {i+1} sub-query: '{sub_q}' → {len(slide_chunks)} chunks")
             else:
-                print(f"    • {b}")
-        print(f"  Notes: {slide.get('speaker_notes', '')}")
-    print("─────────────────────────────────────────────")
+                slide_chunks = context_chunks
+
+            context_text = self._prepare_context(slide_chunks)
+
+            last_err = None
+            for attempt in range(3):
+                prompt = _build_single_slide_prompt(
+                    query, context_text, slide_type,
+                    i + 1, num_slides, lang_label, prior_titles, prior_hints
+                )
+                if attempt > 0:
+                    prompt += (
+                        "\n\nCRITICAL: Your previous attempt was too similar to earlier slides. "
+                        "You MUST change the title and ALL 3 bullets to be substantially different. "
+                        "Focus on a different aspect or sub-topic that has NOT been covered yet.\n"
+                    )
+
+                try:
+                    raw = await self.llm.generate_async(query, slide_chunks, prompt_override=prompt)
+                    slide = _extract_slide_json(raw)
+                    if not slide:
+                        last_err = "extraction failed"
+                        continue
+
+                    fp = _slide_fingerprint(slide)
+                    title_norm = _norm_title(slide.get("title", ""))
+                    if fp in prior_fps or (title_norm and title_norm in {_norm_title(t) for t in prior_titles}):
+                        last_err = "duplicate slide"
+                        continue
+
+                    # Extract topic from first slide if possible
+                    if i == 0:
+                        t = _extract_topic(raw, query[:40])
+                        if t:
+                            topic = t
+
+                    slides.append(slide)
+                    prior_fps.add(fp)
+                    t = (slide.get("title") or "").strip()
+                    if t:
+                        prior_titles.append(t)
+                    h = (slide.get("visual_hint") or "none").strip().lower()
+                    prior_hints.append(h)
+                    log.info(f"  ✔ Slide {i+1}/{num_slides}: '{slide.get('title', '?')}' [hint={h}]")
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    continue
+            else:
+                log.warning(f"  ✗ Slide {i+1}/{num_slides}: could not generate unique slide ({last_err}) — skipping")
+
+        log.info(f"Generated {len(slides)}/{num_slides} slides successfully.")
+        return {"topic": topic, "slides": slides}
+
+    def generate_lesson(self, query: str, context_chunks: list,
+                        num_slides: int = 5, language: str = "English",
+                        available_images: list = None) -> dict:
+        """Sync version for CLI tests — generates slides one by one."""
+        if not context_chunks:
+            return {"topic": query, "slides": [], "_error": "No context retrieved."}
+
+        lang_label   = "French" if language.lower() in ("fr", "french", "français") else "English"
+        slides       = []
+        topic        = query[:40]
+        prior_titles: list[str] = []
+        prior_fps: set[str] = set()
+        prior_hints: list[str] = []
+
+        for i in range(num_slides):
+            slide_type = SLIDE_ARC[i % len(SLIDE_ARC)]
+
+            # Per-slide retrieval
+            if self.retriever is not None:
+                sub_q = _subquery_for_slide(query, slide_type, i + 1, prior_titles)
+                slide_chunks = self.retriever.search(sub_q, top_k=5)
+                if not slide_chunks:
+                    slide_chunks = context_chunks
+            else:
+                slide_chunks = context_chunks
+
+            context_text = self._prepare_context(slide_chunks)
+
+            last_err = None
+            for attempt in range(3):
+                prompt = _build_single_slide_prompt(
+                    query, context_text, slide_type,
+                    i + 1, num_slides, lang_label, prior_titles, prior_hints
+                )
+                if attempt > 0:
+                    prompt += (
+                        "\n\nCRITICAL: Your previous attempt was too similar to earlier slides. "
+                        "You MUST change the title and ALL 3 bullets to be substantially different.\n"
+                    )
+                try:
+                    raw = self.llm.generate(query, slide_chunks, prompt_override=prompt)
+                    slide = _extract_slide_json(raw)
+                    if not slide:
+                        last_err = "extraction failed"
+                        continue
+                    fp = _slide_fingerprint(slide)
+                    title_norm = _norm_title(slide.get("title", ""))
+                    if fp in prior_fps or (title_norm and title_norm in {_norm_title(t) for t in prior_titles}):
+                        last_err = "duplicate slide"
+                        continue
+                    if i == 0:
+                        topic = _extract_topic(raw, query[:40])
+                    slides.append(slide)
+                    prior_fps.add(fp)
+                    t = (slide.get("title") or "").strip()
+                    if t:
+                        prior_titles.append(t)
+                    h = (slide.get("visual_hint") or "none").strip().lower()
+                    prior_hints.append(h)
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    continue
+            else:
+                log.warning(f"Slide {i+1} skipped (could not generate unique slide: {last_err})")
+
+        return {"topic": topic, "slides": slides}
+

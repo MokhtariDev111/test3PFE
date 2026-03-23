@@ -1,17 +1,21 @@
 """
-diagram_generator.py — Mermaid Diagram Generator
-===================================================
-For each content slide, asks the LLM what kind of diagram would help,
-then generates the corresponding Mermaid syntax (and optionally a PNG via
-matplotlib as a fallback for the PPTX export).
+diagram_generator.py  — v2: visual_hint-driven diagram selection
+================================================================
+Fix: reads slide.visual_hint from PedagogicalEngine output and
+     generates the matching Mermaid diagram type instead of
+     blindly alternating flow/mindmap by index.
 
-The returned dict maps: slide_index → {"mermaid": str, "png": str|None}
-so the React frontend can render the live Mermaid diagram, and the PPTX
-exporter can embed the PNG if needed.
+Supported visual_hint values:
+  flowchart  → Mermaid flowchart TD
+  mindmap    → Mermaid mindmap
+  timeline   → Mermaid timeline
+  comparison → Mermaid quadrant or table-style flow
+  process    → Mermaid flowchart with loop arrow
+  hierarchy  → Mermaid flowchart TD (tree shape)
+  none       → skip diagram for this slide
 """
-import json
+
 import logging
-import re
 import tempfile
 from pathlib import Path
 import sys
@@ -24,184 +28,210 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-import numpy as np
 
 from modules.config_loader import CONFIG
-from modules.llm import LLMEngine
 
 log = logging.getLogger("diagram_generator")
 if not log.hasHandlers():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", datefmt="%H:%M:%S")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+                        datefmt="%H:%M:%S")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mermaid generators
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Mermaid generators ────────────────────────────────────────────────────────
 
-def _mermaid_bar(title: str, labels: list[str], values: list[float]) -> str:
-    """Generate Mermaid xychart-beta bar chart syntax."""
-    x_labels = " ".join(f'"{l}"' for l in labels[:8])
-    y_values  = ", ".join(str(round(v, 1)) for v in values[:8])
-    return (
-        "xychart-beta\n"
-        f'  title "{title}"\n'
-        f"  x-axis [{x_labels}]\n"
-        f"  bar [{y_values}]"
-    )
+def _safe(text: str, max_len: int = 40) -> str:
+    """Escape quotes and truncate for Mermaid labels."""
+    return text.replace('"', "'").replace('\n', ' ')[:max_len]
 
 
-def _mermaid_flow(title: str, steps: list[str]) -> str:
-    """Generate Mermaid flowchart TD syntax."""
-    lines = [f"flowchart TD", f'  title["{title}"]']
-    node_ids = [chr(65 + i) for i in range(len(steps))]  # A, B, C, …
-    for nid, step in zip(node_ids, steps):
-        safe = step.replace('"', "'")
-        lines.append(f'  {nid}["{safe}"]')
-    # Add arrows between consecutive nodes
-    for i in range(len(node_ids) - 1):
-        lines.append(f"  {node_ids[i]} --> {node_ids[i+1]}")
+def _mermaid_flowchart(title: str, steps: list[str]) -> str:
+    lines = ["flowchart TD"]
+    ids   = [chr(65 + i) for i in range(min(len(steps), 7))]
+    for nid, step in zip(ids, steps):
+        lines.append(f'  {nid}["{_safe(step)}"]')
+    for i in range(len(ids) - 1):
+        lines.append(f"  {ids[i]} --> {ids[i+1]}")
     return "\n".join(lines)
 
 
 def _mermaid_mindmap(title: str, items: list[str]) -> str:
-    """Generate Mermaid mindmap syntax."""
-    lines = ["mindmap", f"  root((\"{title}\"))"]
+    lines = ["mindmap", f'  root(("{_safe(title, 30)}"))']
     for item in items[:6]:
-        safe = item.replace('"', "'")[:50]
-        lines.append(f'    ("{safe}")')
+        lines.append(f'    ("{_safe(item)}")')
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Matplotlib PNG fallback (kept for PPTX embed)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _to_float(x) -> float | None:
-    try:
-        if x is None: return None
-        if isinstance(x, (int, float, np.number)): return float(x)
-        if isinstance(x, str):
-            s = x.strip().replace(",", "")
-            s = re.sub(r"%$", "", s)
-            return float(s) if s else None
-        return None
-    except Exception:
-        return None
+def _mermaid_timeline(title: str, items: list[str]) -> str:
+    lines = ["timeline", f"  title {_safe(title, 40)}"]
+    for i, item in enumerate(items[:5]):
+        lines.append(f"  Step {i+1} : {_safe(item)}")
+    return "\n".join(lines)
 
 
-def _normalize_bar_data(labels, values):
-    if not isinstance(labels, list): labels = [str(labels)]
-    if not isinstance(values, list): values = [values]
-    fvals = [f for v in values if (f := _to_float(v)) is not None]
-    slabels = [str(l) for l in labels]
-    n = min(len(slabels), len(fvals))
-    return slabels[:n], fvals[:n]
+def _mermaid_comparison(title: str, items: list[str]) -> str:
+    """Simple two-branch flowchart for comparison slides."""
+    if len(items) < 2:
+        return _mermaid_flowchart(title, items)
+    mid   = len(items) // 2
+    left  = items[:mid]
+    right = items[mid:]
+    lines = ["flowchart TD", f'  ROOT["{_safe(title, 30)}"]']
+    lines.append(f'  L["{_safe(left[0])}"]')
+    lines.append(f'  R["{_safe(right[0])}"]')
+    lines.append("  ROOT --> L")
+    lines.append("  ROOT --> R")
+    for i, item in enumerate(left[1:], 1):
+        lines.append(f'  L{i}["{_safe(item)}"]')
+        lines.append(f"  L --> L{i}")
+    for i, item in enumerate(right[1:], 1):
+        lines.append(f'  R{i}["{_safe(item)}"]')
+        lines.append(f"  R --> R{i}")
+    return "\n".join(lines)
 
 
-def _style_fig(fig, ax, bg: str = "#0D1B2A", text: str = "#FFFFFF"):
-    fig.patch.set_facecolor(bg)
-    ax.set_facecolor(bg)
-    ax.tick_params(colors=text, labelsize=9)
-    ax.xaxis.label.set_color(text)
-    ax.yaxis.label.set_color(text)
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#2A3A50")
+def _mermaid_process(title: str, steps: list[str]) -> str:
+    """Cyclical process — flowchart with return arrow."""
+    lines = ["flowchart TD"]
+    ids   = [chr(65 + i) for i in range(min(len(steps), 6))]
+    for nid, step in zip(ids, steps):
+        lines.append(f'  {nid}["{_safe(step)}"]')
+    for i in range(len(ids) - 1):
+        lines.append(f"  {ids[i]} --> {ids[i+1]}")
+    if len(ids) >= 2:
+        lines.append(f"  {ids[-1]} -.->|cycle| {ids[0]}")
+    return "\n".join(lines)
 
 
-def _bar_chart_png(title: str, labels: list[str], values: list[float], color: str, out_path: str) -> str:
+def _mermaid_hierarchy(title: str, items: list[str]) -> str:
+    """Tree hierarchy — root fans out to children."""
+    lines = ["flowchart TD", f'  ROOT["{_safe(title, 30)}"]']
+    for i, item in enumerate(items[:6]):
+        nid = f"N{i}"
+        lines.append(f'  {nid}["{_safe(item)}"]')
+        lines.append(f"  ROOT --> {nid}")
+    return "\n".join(lines)
+
+
+# ── PNG fallback (matplotlib) ─────────────────────────────────────────────────
+
+def _flow_png(title: str, steps: list[str], color: str, out_path: str) -> str:
+    n   = min(len(steps), 6)
     fig, ax = plt.subplots(figsize=(5.5, 3.2))
-    bars = ax.bar(labels, values, color=color, edgecolor="#0D1B2A", linewidth=0.8)
-    ax.set_title(title, color="white", fontsize=11, fontweight="bold", pad=8)
-    _style_fig(fig, ax)
-    max_val = max(values) if values else 0.0
-    for bar, val in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01 * max_val,
-                f"{val:.1f}", ha="center", va="bottom", color="white", fontsize=8)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return out_path
-
-
-def _flow_diagram_png(title: str, steps: list[str], color: str, out_path: str) -> str:
-    n = len(steps)
-    fig, ax = plt.subplots(figsize=(5.5, 3.2))
-    ax.set_xlim(0, 10); ax.set_ylim(0, n + 1)
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, n + 1)
     ax.axis("off")
     fig.patch.set_facecolor("#0D1B2A")
     ax.set_facecolor("#0D1B2A")
-    for i, step in enumerate(steps):
-        y = n - i
-        rect = mpatches.FancyBboxPatch((0.5, y - 0.35), 9, 0.7, boxstyle="round,pad=0.1",
-                                       facecolor=color, edgecolor="#FFFFFF", linewidth=0.8)
+    for i, step in enumerate(steps[:n]):
+        y    = n - i
+        rect = mpatches.FancyBboxPatch(
+            (0.5, y - 0.35), 9, 0.7,
+            boxstyle="round,pad=0.1",
+            facecolor=color, edgecolor="#FFFFFF", linewidth=0.8
+        )
         ax.add_patch(rect)
-        ax.text(5, y, step, ha="center", va="center", color="white", fontsize=9, fontweight="bold")
+        ax.text(5, y, step[:55], ha="center", va="center",
+                color="white", fontsize=8.5, fontweight="bold")
         if i < n - 1:
             ax.annotate("", xy=(5, n - i - 1.35), xytext=(5, n - i - 0.65),
                         arrowprops=dict(arrowstyle="->", color="white", lw=1.5))
-    ax.set_title(title, color="white", fontsize=11, fontweight="bold", y=1.01)
+    ax.set_title(title[:50], color="white", fontsize=10, fontweight="bold", y=1.01)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(out_path, dpi=110, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
     plt.close(fig)
     return out_path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Static Diagram Mapping
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Main generator ────────────────────────────────────────────────────────────
 
 def generate_all_diagrams(slides, theme_color: str = "#1F6FEB",
                            tmp_dir: str = None) -> dict[int, dict]:
     """
-    For each content slide, generate a diagram using its text bullets.
-    This entirely skips the LLM sequential loop, running instantly.
-    Returns a mapping:
-        { slide_index: {"mermaid": "<mermaid syntax>", "png": "<path or None>"} }
+    For each content slide, generate a diagram using slide.visual_hint.
+    Returns: { slide_index: {"mermaid": str, "png": str|None} }
     """
     tmp = Path(tmp_dir or tempfile.mkdtemp())
     tmp.mkdir(parents=True, exist_ok=True)
     diagrams: dict[int, dict] = {}
 
+    # Cycle through hint types for slides that have hint="none" or repeat,
+    # so consecutive slides never share the same diagram type.
+    _fallback_cycle = ["flowchart", "mindmap", "timeline", "comparison", "process", "hierarchy"]
+    _used_hints: list[str] = []
+
     for i, slide in enumerate(slides):
-        if slide.slide_type != "content" or not slide.bullets:
+        # Skip title slides and slides with no bullets
+        if slide.slide_type == "title" or not slide.bullets:
             continue
-            
-        # Avoid diagram overlap if the slide already features a raw PDF image
-        if slide.image_id:
+        # Skip if slide already uses a PDF image
+        if getattr(slide, 'image_id', None):
             continue
 
-        # Extract text elements directly from the slide bullets
+        hint = (getattr(slide, 'visual_hint', 'none') or 'none').lower().strip()
+
+        # If hint is "none", skip — don't force a diagram on every slide
+        if hint == "none":
+            continue
+
+        # If this hint was already used by the previous slide, rotate to next available
+        if _used_hints and hint == _used_hints[-1]:
+            for candidate in _fallback_cycle:
+                if candidate != hint:
+                    hint = candidate
+                    break
+
+        # Extract bullet texts — use full text for uniqueness
         steps = []
-        for b in slide.bullets[:5]:
+        for b in slide.bullets[:6]:
             txt = b.get("text", "") if isinstance(b, dict) else str(b)
             if txt:
                 steps.append(txt)
-                
-        # Need at least 2 points to make a meaningful comparative diagram
+
         if len(steps) < 2:
             continue
-            
-        out_png = str(tmp / f"slide_{i}.png")
-        diag_title = slide.title
 
-        # Alternate dynamically between Flowcharts and Mindmaps for visual distinction
-        diag_type = "flow" if i % 2 == 0 else "mindmap"
-
+        title    = slide.title
+        out_png  = str(tmp / f"slide_{i}.png")
         mermaid_src: str | None = None
-        png_path:    str | None = None
+        png_path: str | None = None
 
-        if diag_type == "flow":
-            mermaid_src = _mermaid_flow(diag_title, steps)
-            try:
-                _flow_diagram_png(diag_title, steps, theme_color, out_png)
+        try:
+            if hint == "flowchart":
+                mermaid_src = _mermaid_flowchart(title, steps)
+                _flow_png(title, steps, theme_color, out_png)
                 png_path = out_png
-            except Exception as e:
-                log.warning(f"PNG fallback failed for slide {i}: {e}")
-        else:  # mindmap
-            mermaid_src = _mermaid_mindmap(diag_title, steps)
-            # matplotlib doesn't natively draw mindmaps cleanly, use the frontend UI mermaid engine
-            
-        diagrams[i] = {"mermaid": mermaid_src, "png": png_path}
-        log.info(f"  ✔ Generated static {diag_type} diagram for slide {i}.")
+
+            elif hint == "mindmap":
+                mermaid_src = _mermaid_mindmap(title, steps)
+
+            elif hint == "timeline":
+                mermaid_src = _mermaid_timeline(title, steps)
+
+            elif hint == "comparison":
+                mermaid_src = _mermaid_comparison(title, steps)
+                _flow_png(title, steps, theme_color, out_png)
+                png_path = out_png
+
+            elif hint == "process":
+                mermaid_src = _mermaid_process(title, steps)
+                _flow_png(title, steps, theme_color, out_png)
+                png_path = out_png
+
+            elif hint == "hierarchy":
+                mermaid_src = _mermaid_hierarchy(title, steps)
+
+            else:
+                mermaid_src = _mermaid_flowchart(title, steps)
+
+        except Exception as e:
+            log.warning(f"Diagram generation failed for slide {i} (hint={hint}): {e}")
+            mermaid_src = None
+
+        if mermaid_src:
+            diagrams[i] = {"mermaid": mermaid_src, "png": png_path}
+            _used_hints.append(hint)
+            log.info(f"  ✔ Slide {i}: {hint} diagram generated.")
 
     return diagrams

@@ -62,7 +62,7 @@ def load_pdf(path: Path) -> list[DocumentPage]:
         if len(text) < 500 and len(drawings) > 2:
             try:
                 # Render the vector diagram page as a crisp image
-                pix = page.get_pixmap(dpi=150)
+                pix = page.get_pixmap(dpi=120)  # reduced from 150 for speed
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 pages.append(
                     DocumentPage(
@@ -75,31 +75,34 @@ def load_pdf(path: Path) -> list[DocumentPage]:
             except Exception as e:
                 log.warning(f"Failed to extract Page {i+1} diagram from {path.name}: {e}")
                 
-        # 2. Extract embedded raster images on this page
-        for img_idx, img_info in enumerate(page.get_images(full=True)):
-            xref = img_info[0]
+        # 2. Extract embedded raster images — limit to 1 per page to avoid bloat
+        img_list = page.get_images(full=True)
+        if img_list:
+            xref = img_list[0][0]  # only first image per page
             base_img = doc.extract_image(xref)
             if base_img:
-                from io import BytesIO
                 try:
                     pil_img = Image.open(io.BytesIO(base_img["image"])).convert("RGB")
-                    # Store as base64 instead of holding massive uncompressed PIL objects in RAM
-                    b64_img = _pil_to_base64(pil_img)
-                    pages.append(
-                        DocumentPage(
-                            source=f"{path.name} (page {i+1} img {img_idx+1})", 
-                            page=i + 1, 
-                            type="pdf_image", 
-                            image=b64_img
+                    # Skip tiny images (icons, decorations)
+                    if pil_img.width < 100 or pil_img.height < 100:
+                        doc.close()
+                    else:
+                        b64_img = _pil_to_base64(pil_img)
+                        pages.append(
+                            DocumentPage(
+                                source=f"{path.name} (page {i+1} img)", 
+                                page=i + 1, 
+                                type="pdf_image", 
+                                image=b64_img
+                            )
                         )
-                    )
                 except Exception as e:
-                    log.warning(f"Failed to load image {img_idx} on page {i+1}: {e}")
+                    log.warning(f"Failed to load image on page {i+1}: {e}")
                     
     doc.close()
     
-    img_count = sum(1 for p in pages if p.type == "image")
-    txt_count = len(pages) - img_count
+    img_count = sum(1 for p in pages if p.type == "pdf_image")
+    txt_count = sum(1 for p in pages if p.type == "pdf")
     log.info(f"[PDF] {path.name}  →  {txt_count} text pg(s), {img_count} embedded img(s)")
     return pages
 

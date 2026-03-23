@@ -49,8 +49,8 @@ llm:
   model: "mistral"
   
   # Generation parameters
-  temperature: 0.3
-  context_length: 4096
+  temperature: 0.7
+  context_length: 2048
 
 # Step 11 — Streamlit
 streamlit:
