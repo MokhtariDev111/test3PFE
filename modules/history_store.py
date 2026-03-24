@@ -39,33 +39,33 @@ def _save(records: list[dict]):
 
 
 def record_presentation(
-    pptx_path: str,
+    html_path: str,
     prompt: str,
     topic: str,
     num_slides: int,
     theme_name: str,
     model: str,
-    slides: list = None
+    slides: list = None,
+    session_id: str = None
 ):
     """Append a presentation record to the history file."""
-    p = Path(pptx_path)
+    p = Path(html_path) if html_path else None
     entry = {
-        "id":         datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "id":         session_id or f'pres_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "prompt":     prompt,
         "topic":      topic,
         "num_slides": num_slides,
         "theme":      theme_name,
         "model":      model,
-        "filename":   p.name,
-        "size_kb":    round(p.stat().st_size / 1024, 1) if p.exists() else 0,
+        "html_path":  str(p) if p else "",
         "slides":     slides or [],
     }
     with _history_lock:
         records = _load()
         records.insert(0, entry)   # newest first
         _save(records)
-    log.info(f"History updated: {entry['filename']}")
+    log.info(f"History updated: {entry['topic']}")
     return entry
 
 

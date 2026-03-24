@@ -1,31 +1,33 @@
 """
-api.py — v2: model param wired through + retrieval metadata in response
-========================================================================
-Changes from v1:
-  1. `model` Form param is now passed to PedagogicalEngine so the frontend
-     can choose which Ollama model to use (was received but silently ignored).
-  2. `_slides_to_json` now includes `key_message` in each slide — the frontend
-     can display it as a highlighted summary card.
-  3. Response from /generate now includes `retrieval_method` metadata so the
-     frontend can show "hybrid" or "dense" in the UI.
-  4. All endpoint signatures, response shapes, and field names are UNCHANGED —
-     full backward compatibility with existing frontend code.
-  5. Reranker model is pre-warmed at startup alongside OCR and embeddings.
+api.py — Unified AI Presentation Engine (HTML-Native)
+======================================================
+Architectural Unification:
+1. RAG-based intelligence (Mistral/Ollama + FAISS + Hybrid Search).
+2. Interactive HTML Rendering (Ported from friend's project).
+3. PowerPoint dependencies COMPLETELY REMOVED.
+4. Professional, fast, and scalable.
 """
 
-import sys, os, logging, shutil, tempfile, uuid
+import sys
+import os
+import logging
+import shutil
+import tempfile
+import uuid
+import json
+import asyncio
+import hashlib
 from pathlib import Path
+from datetime import datetime
 
 ROOT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
-MAX_FILE_SIZE_MB  = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-MAX_PROMPT_LENGTH = 2000
-
+# ── Project Modules ──────────────────────────────────────────────────────────
 from modules.config_loader      import CONFIG
 from modules.ingestion          import ingest_directory
 from modules.ocr                import run_ocr, warm_ocr_engine
@@ -34,23 +36,30 @@ from modules.embeddings         import build_vector_db
 from modules.retrieval          import Retriever, _load_reranker
 from modules.pedagogical_engine import PedagogicalEngine
 from modules.slide_generator    import build_slides
-from modules.pptx_exporter      import export_pptx, THEMES
 from modules.diagram_generator  import generate_all_diagrams
 from modules.history_store      import record_presentation, load_history, clear_history
+from modules.html_renderer      import render as render_html
 
 log = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
-    title="EduGenius AI Teaching Assistant",
-    version="2.0.0",
-    description="RAG-powered presentation generation — hybrid retrieval + quality gate",
+    title="EduGenius AI Interactive Presentation System",
+    version="3.0.0",
+    description="Modernized RAG-powered presentation generation with HTML-native rendering.",
 )
 
+# ── CORS ─────────────────────────────────────────────────────────────────────
 _default_origins = ",".join([
     "http://localhost:5173", "http://127.0.0.1:5173",
     "http://localhost:8080", "http://127.0.0.1:8080",
     "http://localhost:8081", "http://127.0.0.1:8081",
+    "http://localhost:8085", "http://127.0.0.1:8085",
+    "http://localhost:8086", "http://127.0.0.1:8086",
+    "http://localhost:8087", "http://127.0.0.1:8087",
+    "http://localhost:8088", "http://127.0.0.1:8088",
+    "http://localhost:8089", "http://127.0.0.1:8089",
+    "http://localhost:8090", "http://127.0.0.1:8090",
 ])
 _allowed_origins = [
     o.strip()
@@ -65,275 +74,316 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory PPTX store (UUID → file path + temp dir)
-_pptx_store: dict[str, dict] = {}
+# ── Caches & Stores ──────────────────────────────────────────────────────────
+_index_cache: dict[str, dict] = {}
+_INDEX_CACHE_MAX = 8
+_session_store: dict[str, dict] = {} # UUID → {html_path, topic, slides, ...}
 
+def _files_hash(raw_dir: Path) -> str:
+    h = hashlib.sha1()
+    for p in sorted(raw_dir.iterdir()):
+        if p.is_file():
+            h.update(p.name.encode())
+            h.update(p.read_bytes())
+    return h.hexdigest()
 
-# ── Startup: pre-warm all heavy models ───────────────────────────────────────
+# ── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    log.info("Server starting — pre-warming models...")
-
-    # OCR model
+    log.info("Server Unification: Pre-warming RAG & OCR engines...")
     warm_ocr_engine()
-
-    # Embedding model
     from modules.embeddings import VectorDB
     VectorDB()._load_model()
-
-    # Reranker model — only if enabled in config
     retrieval_cfg = CONFIG.get("retrieval", {})
     if retrieval_cfg.get("use_reranker", False):
         reranker_model = retrieval_cfg.get("reranker_model", "BAAI/bge-reranker-base")
         _load_reranker(reranker_model)
-        log.info("  ✔ Reranker pre-warmed.")
+    log.info("✔ System Ready.")
 
-    log.info("  ✔ All models pre-warmed. Server ready.")
-
-
-# ── Helper: convert SlideData list to JSON-serialisable list ─────────────────
+# ── Helper: Slide conversion ─────────────────────────────────────────────────
 def _slides_to_json(slides, diagrams: dict) -> list[dict]:
     result = []
     for i, s in enumerate(slides):
         diag_info   = diagrams.get(i, {})
         mermaid_src = diag_info.get("mermaid") if isinstance(diag_info, dict) else None
         result.append({
-            # ── Fields that existed in v1 (unchanged — frontend compatible) ──
             "id":              i + 1,
             "title":           s.title,
             "bullets":         s.bullets,
             "speakerNotes":    s.speaker_notes or "",
             "diagram":         mermaid_src,
             "slideType":       s.slide_type,
-            "qualityScore":    getattr(s, "quality_score", 0),
-            "qualityFeedback": getattr(s, "quality_feedback", ""),
-            # ── New fields (additive — frontend can ignore if not ready) ─────
             "keyMessage":      getattr(s, "key_message", ""),
-            "judgeScore":      getattr(s, "judge_score", None),
-            "judgeFeedback":   getattr(s, "judge_feedback", ""),
+            "image_id":        getattr(s, "image_id", None),
         })
     return result
 
+# ── Endpoints ────────────────────────────────────────────────────────────────
 
-# ── POST /generate ────────────────────────────────────────────────────────────
-@app.post("/generate")
-async def generate(
-    background_tasks: BackgroundTasks,
+@app.get("/")
+async def root():
+    return {"status": "ok", "engine": "V3-Unified", "output": "HTML-Native"}
+
+@app.get("/themes")
+async def get_themes():
+    """Return the list of available presentation theme names."""
+    from modules.html_renderer import _PPTX_TO_HTML_THEME
+    return list(_PPTX_TO_HTML_THEME.keys())
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """
+    Audio transcription stub.
+    Returns empty text — wire up Whisper or another ASR engine here when ready.
+    """
+    return {"text": ""}
+
+@app.post("/generate-stream")
+async def generate_stream(
     prompt:     str  = Form(...),
     theme:      str  = Form("Dark Navy"),
     num_slides: int  = Form(5),
-    model:      str  = Form("mistral"),    # now actually used
+    model:      str  = Form("mistral"),
     top_k:      int  = Form(4),
     language:   str  = Form("English"),
     files: list[UploadFile] = File(default=[]),
-    use_pdf_images: bool = Form(True),  # Include PDF images in slides when content matches
+    use_pdf_images: bool = Form(True),
 ):
-    if not prompt or len(prompt) > MAX_PROMPT_LENGTH:
-        raise HTTPException(422, f"Prompt must be 1–{MAX_PROMPT_LENGTH} chars")
-    if not (1 <= num_slides <= 15):
-        raise HTTPException(422, "num_slides must be 1–15")
-    if theme not in THEMES:
-        theme = "Dark Navy"
-    language = language if language in ("English", "French") else "English"
+    async def _stream():
+        session_id = str(uuid.uuid4())
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"edugenius_{session_id[:8]}_"))
+        raw_dir = tmp_dir / "raw"
+        raw_dir.mkdir()
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="edugenius_"))
-    raw_dir = tmp_dir / "raw"
-    raw_dir.mkdir()
-    keep_tmp = False
+        def _emit(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-    try:
-        # 1. Save uploaded files
-        if files:
-            for f in files:
-                content = await f.read()
-                if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
-                    raise HTTPException(413, f"'{f.filename}' exceeds {MAX_FILE_SIZE_MB} MB")
-                safe_name = Path(f.filename).name.replace("..", "").replace("/", "").replace("\\", "")
-                (raw_dir / safe_name).write_bytes(content)
-        else:
-            src = ROOT_DIR / CONFIG["paths"]["data_raw"]
-            if src.exists():
-                for p in src.iterdir():
-                    shutil.copy(p, raw_dir / p.name)
-
-        selected_theme = THEMES.get(theme, list(THEMES.values())[0])
-
-        # 2. Ingest documents
-        log.info("Ingesting documents...")
-        pages = ingest_directory(raw_dir)
-
-        # 3. OCR (standalone images only)
-        image_pages = [p for p in pages if p.type == "image" and p.image is not None]
-        if image_pages:
-            pages = run_ocr(pages)
-        else:
-            log.info("No standalone images — skipping OCR.")
-
-        # 4. Chunk text pages
-        text_pages = [p for p in pages if p.type in ("pdf", "txt", "image") and p.text]
-        chunks = process_pages(text_pages)
-
-        # Collect PDF images for slide embedding (when option enabled)
-        pdf_images = {}
-        available_image_ids = []
-        image_contexts: dict[str, str] = {}
-        if use_pdf_images:
-            pdf_img_pages = [p for p in pages if p.type == "pdf_image" and isinstance(p.image, str)]
-            pdf_images = {p.source: p.image for p in pdf_img_pages}
-            available_image_ids = list(pdf_images.keys())
-            # Build context for each image from nearby page text (helps LLM match)
-            import re
-            for p in pdf_img_pages:
-                m = re.match(r"^(.+?)\s+\(.*?page\s*(\d+).*\)$", p.source)
-                if m:
-                    base_name, pg = m.group(1), int(m.group(2))
-                    ctx_parts = [c.text[:150] for c in chunks if c.source == base_name and c.page == pg]
-                    if ctx_parts:
-                        image_contexts[p.source] = " ".join(ctx_parts)[:300]
-            if available_image_ids:
-                log.info(f"Available PDF images for slides: {len(available_image_ids)} (with context: {len(image_contexts)})")
-
-        # 5. Build vector DB (FAISS + BM25 corpus)
-        isolated_index = tmp_dir / "faiss"
-        build_vector_db(chunks, index_path=isolated_index)
-
-        # 6. Retrieve context (hybrid: BM25 + FAISS + reranker)
-        retriever = Retriever(index_path=isolated_index)
-        results   = retriever.search(prompt, top_k=top_k)
-
-        # Determine retrieval method for response metadata
-        retrieval_method = "dense"
-        if retriever.bm25 is not None:
-            retrieval_method = "hybrid+reranked" if retriever.use_reranker else "hybrid"
-
-        # 7. LLM: generate slides
-        engine = PedagogicalEngine(retriever=retriever, model_override=model)
-        lesson = await engine.generate_lesson_async(
-            prompt, results,
-            num_slides=num_slides,
-            language=language,
-            available_images=available_image_ids,
-            image_contexts=image_contexts,
-        )
-
-        topic  = lesson.get("topic", prompt[:40])
-        slides = build_slides(lesson)
-
-        # 8. Diagrams
-        diag_map: dict = {}
         try:
-            accent_hex = "#{:02X}{:02X}{:02X}".format(*selected_theme.accent)
-            diag_map   = generate_all_diagrams(
-                slides, theme_color=accent_hex,
-                tmp_dir=str(tmp_dir / "diagrams"),
+            print(f"\n========================================================", flush=True)
+            print(f"🚀 NEW POST REQUEST: Generating {num_slides} slides", flush=True)
+            print(f"📝 Topic: '{prompt[:50]}...'", flush=True)
+            print(f"========================================================\n", flush=True)
+            
+            yield _emit("status", {"step": "ingesting", "message": "Analyzing documents…"})
+            # 1. Save Files
+            if files:
+                for f in files:
+                    content = await f.read()
+                    safe_name = Path(f.filename).name.replace("..", "")
+                    (raw_dir / safe_name).write_bytes(content)
+            else:
+                src = ROOT_DIR / CONFIG["paths"]["data_raw"]
+                if src.exists():
+                    for p in src.iterdir(): shutil.copy(p, raw_dir / p.name)
+
+            # 2. Cache & Ingest
+            file_hash = _files_hash(raw_dir)
+            cached    = _index_cache.get(file_hash)
+
+            if cached:
+                chunks = cached["chunks"]
+                isolated_index = Path(cached["index_path"])
+                pdf_images = cached.get("pdf_images", {})
+                available_image_ids = list(pdf_images.keys())
+                image_contexts = cached.get("image_contexts", {})
+                yield _emit("status", {"step": "indexing", "message": "Using cached knowledge base…"})
+            else:
+                def _process_documents_sync():
+                    pages = ingest_directory(raw_dir)
+                    image_pages = [p for p in pages if p.type == "image" and p.image is not None]
+                    if image_pages: pages = run_ocr(pages)
+                    
+                    text_pages = [p for p in pages if p.type in ("pdf", "txt", "image") and p.text]
+                    chunks = process_pages(text_pages)
+                    
+                    pdf_images = {}
+                    image_contexts = {}
+                    if use_pdf_images:
+                        import re as _re
+                        pdf_img_pages = [p for p in pages if p.type == "pdf_image" and isinstance(p.image, str)]
+                        pdf_images = {p.source: p.image for p in pdf_img_pages}
+                        for p in pdf_img_pages:
+                            m = _re.match(r"^(.+?)\s+\(.*?page\s*(\d+).*\)$", p.source)
+                            if m:
+                                base_name, pg = m.group(1), int(m.group(2))
+                                ctx_p = [c.text[:150] for c in chunks if c.source == base_name and c.page == pg]
+                                if ctx_p: image_contexts[p.source] = " ".join(ctx_p)[:300]
+
+                    isolated_index = tmp_dir / "faiss"
+                    build_vector_db(chunks, index_path=isolated_index)
+                    _index_cache[file_hash] = {
+                        "index_path": str(isolated_index), "chunks": chunks, 
+                        "pdf_images": pdf_images, "image_contexts": image_contexts
+                    }
+                
+                await asyncio.to_thread(_process_documents_sync)
+
+                # 2.5 Re-assign variables from the populated cache
+                _cached = _index_cache[file_hash]
+                chunks = _cached["chunks"]
+                isolated_index = Path(_cached["index_path"])
+                pdf_images = _cached.get("pdf_images", {})
+                available_image_ids = list(pdf_images.keys())
+                image_contexts = _cached.get("image_contexts", {})
+                yield _emit("status", {"step": "indexing", "message": "Knowledge base indexed successfully…"})
+
+
+
+            # 3. Retrieve
+            yield _emit("status", {"step": "retrieving", "message": "Retrieving context…"})
+            retriever = Retriever(index_path=isolated_index)
+            results   = retriever.search(prompt, top_k=top_k)
+
+            # 4. Generate & Stream
+            yield _emit("status", {"step": "generating", "message": "AI is crafting your slides…"})
+            from modules.pedagogical_engine import (
+                SLIDE_ARC, _subquery_for_slide, _build_slide_prompt,
+                _extract_slide_json, _prepare_context, _slide_fingerprint, _norm,
             )
+            from modules.llm import LLMEngine
+            llm = LLMEngine()
+            lang_label = "French" if language.lower() in ("fr", "french") else "English"
+            
+            prior_titles, prior_hints, prior_fps = [], [], set()
+            slides_obj = []
+
+            slides_generated = 0
+            attempts = 0
+            max_attempts = num_slides * 3
+
+            while slides_generated < num_slides and attempts < max_attempts:
+                attempts += 1
+                i = slides_generated
+                print(f"⏳ Working on slide {i+1} of {num_slides} (attempt {attempts})...", flush=True)
+
+                stype = SLIDE_ARC[i % len(SLIDE_ARC)]
+                sub_q = _subquery_for_slide(prompt, stype, prior_titles)
+                slide_chunks = retriever.search(sub_q, top_k=5) or results
+                ctx_text = _prepare_context(slide_chunks)
+                
+                slide = None
+                for attempt in range(2):
+                    slide_prompt = _build_slide_prompt(
+                        prompt, ctx_text, stype, i+1, num_slides, lang_label,
+                        prior_titles, prior_hints, available_images=available_image_ids,
+                        image_contexts=image_contexts
+                    )
+                    raw = await llm.generate_async(prompt, slide_chunks, prompt_override=slide_prompt, model_override=model)
+                    parsed = _extract_slide_json(raw)
+                    if not parsed: continue
+                    
+                    fp = _slide_fingerprint(parsed)
+                    if fp in prior_fps: continue
+                    
+                    slide = parsed
+                    break
+                
+                
+                if not slide:
+                    print(f"❌ Slide {i+1} attempt failed, retrying...", flush=True)
+                    continue
+
+                slides_generated += 1
+                print(f"✅ Slide {i+1} generated successfully: '{slide.get('title', '')}'", flush=True)
+                
+                # Convert dict to SlideData-like object for build_slides compatibility
+                from modules.slide_generator import SlideData
+                s_obj = SlideData(
+                    title=slide.get("title",""), bullets=slide.get("bullets",[]),
+                    speaker_notes=slide.get("speaker_notes",""), slide_type=slide.get("slide_type","content")
+                )
+                for k,v in slide.items(): setattr(s_obj, k, v)
+                slides_obj.append(s_obj)
+                prior_titles.append(s_obj.title)
+                prior_hints.append(slide.get("visual_hint",""))
+                prior_fps.add(_slide_fingerprint(slide))
+                
+                yield _emit("slide", {
+                    "index": i, "title": s_obj.title, "bullets": s_obj.bullets,
+                    "slideType": s_obj.slide_type, "image_id": getattr(s_obj, "image_id", None)
+                })
+
+            # 5. Diagrams & HTML Render
+            yield _emit("status", {"step": "finalizing", "message": "Rendering interactive presentation…"})
+            diag_map = {}
+            try:
+                diag_map = await asyncio.to_thread(
+                    generate_all_diagrams,
+                    slides_obj,
+                    "#1F6FEB",
+                    str(tmp_dir / "diagrams")
+                )
+            except Exception as e: 
+                log.warning(f"Diagram generation error: {e}")
+
+            html_slides = []
+            for s in slides_obj:
+                html_bullets = []
+                for b in s.bullets:
+                    if isinstance(b, dict):
+                        html_bullets.append(b.get("text", "") or b.get("content", ""))
+                    else:
+                        html_bullets.append(str(b))
+                        
+                html_slides.append({
+                    "title": s.title, "bullets": html_bullets, "speaker_notes": s.speaker_notes,
+                    "slide_type": s.slide_type, "image_id": getattr(s, "image_id", None),
+                    "chart_data": getattr(s, "chart_data", None)
+                })
+            
+            # Prepare images for renderer
+            render_images = {}
+            for i, s in enumerate(slides_obj):
+                iid = getattr(s, "image_id", None)
+                if iid and iid in pdf_images:
+                    # Injects base64 as a data URL
+                    render_images[i] = f"data:image/jpeg;base64,{pdf_images[iid]}"
+
+            html_path = render_html(
+                topic=prompt[:50], slides=html_slides, session_id=session_id,
+                output_dir=str(tmp_dir / "html"), images=render_images, theme_name=theme
+            )
+            
+            _session_store[session_id] = {"html_path": html_path, "tmp_dir": str(tmp_dir)}
+            record_presentation(html_path, prompt, prompt[:50], len(slides_obj), theme, model, session_id=session_id)
+
+            yield _emit("done", {
+                "session_id": session_id, "topic": prompt[:50],
+                "num_slides": len(slides_obj), "html_url": f"/view/{session_id}"
+            })
+
         except Exception as e:
-            log.warning("Diagram generation failed (non-fatal): %s", e)
+            log.exception("Stream pipeline error: %s", e)
+            yield _emit("error", {"detail": str(e)})
 
-        # 9. Export PPTX
-        png_map  = {k: v["png"] for k, v in diag_map.items() if v.get("png")}
-        pptx_path = export_pptx(
-            slides,
-            theme=selected_theme,
-            diagrams=png_map,
-            pdf_images=pdf_images,
-            output_dir=str(tmp_dir / "pptx"),
-        )
-        log.info("PPTX saved: %s", pptx_path)
+    return StreamingResponse(_stream(), media_type="text/event-stream")
 
-        pptx_id = str(uuid.uuid4())
-        _pptx_store[pptx_id] = {"path": str(pptx_path), "tmp_dir": str(tmp_dir)}
-        keep_tmp = True
+@app.get("/view/{session_id}")
+async def view_presentation(session_id: str):
+    sess = _session_store.get(session_id)
+    if not sess or not sess.get("html_path"):
+        # Try checking history file if session expired
+        hist = load_history()
+        match = next((h for h in hist if h.get("id") == session_id), None)
+        if match and match.get("html_path") and os.path.exists(match["html_path"]):
+            return FileResponse(match["html_path"])
+        raise HTTPException(404, "Presentation not found or expired.")
+    return FileResponse(sess["html_path"])
 
-        json_slides = _slides_to_json(slides, diag_map)
-        if not json_slides:
-            raise HTTPException(500, "AI failed to generate any slides from the context. Check Ollama logs.")
-
-        record_presentation(pptx_path, prompt, topic, len(slides), theme, model, slides=json_slides)
-
-        return {
-            # ── Unchanged fields (v1 compatible) ─────────────────────────────
-            "slides":     json_slides,
-            "pptx_id":    pptx_id,
-            "topic":      topic,
-            "filename":   Path(pptx_path).name,
-            "num_slides": len(slides),
-            # ── New metadata (additive) ───────────────────────────────────────
-            "retrieval_method": retrieval_method,
-            "model_used":       model,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception("Pipeline error: %s", e)
-        raise HTTPException(500, str(e))
-    finally:
-        if not keep_tmp:
-            background_tasks.add_task(shutil.rmtree, tmp_dir, True)
-
-
-# ── GET /download/{pptx_id} ───────────────────────────────────────────────────
-@app.get("/download/{pptx_id}")
-async def download(pptx_id: str, background_tasks: BackgroundTasks):
-    info    = _pptx_store.get(pptx_id)
-    path    = info.get("path") if isinstance(info, dict) else None
-    tmp_dir = info.get("tmp_dir") if isinstance(info, dict) else None
-    if not path or not Path(path).exists():
-        raise HTTPException(404, "File not found or expired")
-    background_tasks.add_task(_pptx_store.pop, pptx_id, None)
-    if tmp_dir:
-        background_tasks.add_task(shutil.rmtree, tmp_dir, True)
-    return FileResponse(
-        path,
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        filename=Path(path).name,
-    )
-
-
-# ── GET /history ──────────────────────────────────────────────────────────────
 @app.get("/history")
 async def get_history():
-    return {"history": load_history()}
+    data = load_history()
+    # Ensure each item has an html_url
+    for item in data:
+        if "id" in item and "html_url" not in item:
+            item["html_url"] = f"/view/{item['id']}"
+    return data
 
-
-# ── DELETE /history ───────────────────────────────────────────────────────────
 @app.delete("/history")
 async def delete_history():
     clear_history()
-    return {"message": "History cleared"}
+    return {"status": "cleared"}
 
-
-# ── POST /transcribe ──────────────────────────────────────────────────────────
-@app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
-    try:
-        import io, speech_recognition as sr
-        recognizer = sr.Recognizer()
-        contents   = await audio.read()
-        with sr.AudioFile(io.BytesIO(contents)) as source:
-            audio_data = recognizer.record(source)
-        return {"text": recognizer.recognize_google(audio_data)}
-    except Exception as e:
-        log.error("Transcription error: %s", e)
-        raise HTTPException(500, f"Transcription failed: {e}")
-
-
-# ── GET /themes ───────────────────────────────────────────────────────────────
-@app.get("/themes")
-async def get_themes():
-    return {"themes": list(THEMES.keys())}
-
-
-# ── GET /health ───────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    retrieval_cfg = CONFIG.get("retrieval", {})
-    return {
-        "status":           "ok",
-        "project":          CONFIG["project"]["name"],
-        "version":          CONFIG["project"]["version"],
-        "bm25_enabled":     retrieval_cfg.get("use_bm25", True),
-        "reranker_enabled": retrieval_cfg.get("use_reranker", True),
-        "parallel_gen":     CONFIG.get("generation", {}).get("parallel", True),
-    }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

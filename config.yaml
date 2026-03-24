@@ -19,7 +19,7 @@ paths:
 ocr:
   engine: "easyocr"          # "easyocr" | "tesseract"
   languages: ["fr", "en"]
-  device: "cpu"              # NEW: force OCR to CPU to free GPU for Ollama
+  device: "cuda"             # NEW: force OCR to CPU to free GPU for Ollama
 
 # Step 4 — Text Processing
 text_processing:
@@ -29,7 +29,7 @@ text_processing:
 # Step 5 — Embeddings
 embeddings:
   model: "BAAI/bge-small-en-v1.5"
-  device: "cpu"              # CHANGED: use CPU to free GPU for Ollama (embedding is fast enough on CPU)
+  device: "cuda"             # CHANGED: use CPU to free GPU for Ollama (embedding is fast enough on CPU)
 
 # Step 5 — Vector DB
 vector_db:
@@ -51,7 +51,7 @@ retrieval:
 llm:
   backend: "ollama"
   api_url: "http://127.0.0.1:11434/api/generate"
-  model: "mistral:latest"
+  model: "llama3.2"
   temperature: 0.7
   context_length: 2048       # Reduced from 3072 to save VRAM
 
@@ -59,7 +59,7 @@ llm:
   # Used for the LLM-as-judge call that validates slide quality.
   # Set to the same as `model` to use one model for everything (cheaper).
   # Set to a stronger model (e.g. "llama3:8b") for better quality filtering.
-  judge_model: "mistral:latest"
+  judge_model: "mistral"
   judge_enabled: false       # CHANGED: disabled to reduce LLM calls and save time
 
 # ── NEW: Generation settings ─────────────────────────────────────────────────
