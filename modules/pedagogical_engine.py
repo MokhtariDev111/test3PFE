@@ -25,6 +25,8 @@ import re
 from pathlib import Path
 import sys
 import hashlib
+from modules.context_manager import prepare_context
+from modules.schemas import validate_and_fix_slide, validate_slide
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -57,7 +59,9 @@ _ONE_SLIDE_SCHEMA = """{
   "bullets": [
     {"text": "Specific fact, mechanism, or data point with concrete detail", "source_id": "Page X or Source Name"},
     {"text": "Second distinct, non-overlapping point advancing the lesson", "source_id": "Page Y or Source Name"},
-    {"text": "Third point — application, implication, or real-world example", "source_id": "Page Z or Source Name"}
+    {"text": "Third point — application, implication, or real-world example", "source_id": "Page Z or Source Name"},
+    {"text": "Fourth specific detail, evidence, or supporting fact", "source_id": "Page W or Source Name"},
+    {"text": "Fifth insightful takeaway or crucial data point", "source_id": "Page V or Source Name"}
   ],
   "key_message": "One-sentence high-level synthesis NOT present in the bullets",
   "visual_hint": "flowchart",
@@ -183,32 +187,51 @@ def _repair_json(raw: str) -> str:
 
 
 def _extract_slide_json(raw: str) -> dict | None:
+    """Parse and validate slide JSON from LLM output."""
     if not raw or not raw.strip():
         return None
+    
+    obj = None
+    
+    # Try 1: Direct JSON parse
     try:
         obj = json.loads(raw)
         if "title" in obj and "bullets" in obj:
-            return obj
+            pass  # Success, continue to validation
+        else:
+            obj = None
     except json.JSONDecodeError:
-        pass
-    # Fallback: try after repair
-    try:
-        obj = json.loads(_repair_json(raw))
-        if "title" in obj and "bullets" in obj:
-            return obj
-    except json.JSONDecodeError:
-        pass
-    # Last resort: regex extract
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
+        obj = None
+    
+    # Try 2: Repair and parse
+    if obj is None:
         try:
-            obj = json.loads(match.group())
-            if "title" in obj:
-                return obj
+            obj = json.loads(_repair_json(raw))
+            if "title" not in obj or "bullets" not in obj:
+                obj = None
         except json.JSONDecodeError:
-            pass
-    log.error(f"Could not parse slide JSON from: {raw[:200]!r}")
-    return None
+            obj = None
+    
+    # Try 3: Last resort - regex extract
+    if obj is None:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                obj = json.loads(match.group())
+                if "title" not in obj:
+                    obj = None
+            except json.JSONDecodeError:
+                obj = None
+    
+    # Failed all parsing attempts
+    if obj is None:
+        log.error(f"Could not parse slide JSON from: {raw[:200]!r}")
+        return None
+    
+    # Validate and fix using Pydantic schema
+    validated = validate_and_fix_slide(obj)
+    
+    return validated
 
 
 # ── Deduplication helpers ─────────────────────────────────────────────────────
@@ -234,18 +257,14 @@ def _slide_fingerprint(slide: dict) -> str:
 
 # ── Context preparation ───────────────────────────────────────────────────────
 
-def _prepare_context(context_chunks: list, max_chars: int = 2400) -> str:
-    seen = set()
-    unique = []
-    for c in context_chunks:
-        key = c.text.strip()[:120]
-        if key not in seen:
-            seen.add(key)
-            unique.append(c)
-    text = "\n".join(f"[{c.source} p{c.page}] {c.text}" for c in unique)
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n[truncated]"
-    return text
+def _prepare_context(chunks: list, max_chars: int = 2500) -> str:
+    """Prepare context using smart truncation."""
+    return prepare_context(
+        chunks, 
+        max_chars=max_chars,
+        include_metadata=True,
+        deduplicate=True,
+    )
 
 
 # ── Main engine ───────────────────────────────────────────────────────────────

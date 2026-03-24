@@ -9,10 +9,13 @@ Optimizations:
 """
 
 import json
+import asyncio
 import logging
 import os
 from pathlib import Path
 import sys
+from modules.llm_cache import get_cached, set_cached
+from modules.retry_utils import retry_async, RateLimitHandler, RETRYABLE_STATUS_CODES
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -49,16 +52,24 @@ class LLMEngine:
         # Backend selection
         self.backend = "groq" if self.groq_api_key else "ollama"
         log.info(f"LLM Backend: {self.backend.upper()}")
+        # Rate limit handler
+        self._rate_limiter = RateLimitHandler(base_delay=1.0)
 
     # ══════════════════════════════════════════════════════════════════════════
     # GROQ BACKEND (Primary - Fast)
     # ══════════════════════════════════════════════════════════════════════════
     
     async def _call_groq(self, prompt: str, model: str = None, json_mode: bool = True) -> str:
-        """Call Groq API (OpenAI-compatible)."""
+        """Call Groq API with caching and retry logic."""
         import httpx
         
         model = model or self.groq_model
+        
+        # Check cache first
+        cached = get_cached(prompt, model)
+        if cached:
+            log.info(f"  ⚡ Cache HIT for Groq ({model})")
+            return cached
         
         headers = {
             "Authorization": f"Bearer {self.groq_api_key}",
@@ -78,22 +89,40 @@ class LLMEngine:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         
-        try:
+        async def _make_request() -> str:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(self.groq_url, json=payload, headers=headers)
+                
+                # Handle rate limiting
+                if response.status_code == 429:
+                    retry_after = float(response.headers.get("retry-after", 2))
+                    delay = await self._rate_limiter.handle_rate_limit(retry_after)
+                    await asyncio.sleep(delay)
+                    raise ConnectionError("Rate limited, retrying...")
+                
+                # Handle other retryable errors
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    raise ConnectionError(f"Server error {response.status_code}")
+                
                 response.raise_for_status()
+                self._rate_limiter.reset()  # Success — reset rate limiter
+                
                 data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                result = data["choices"][0]["message"]["content"].strip()
+                
+                # Cache successful response
+                set_cached(prompt, model, result)
+                
+                return result
         
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                log.warning("Groq rate limit hit - falling back to Ollama")
-                return await self._call_ollama(prompt, self.ollama_model, json_mode)
-            log.error(f"Groq API error: {e.response.text}")
-            raise
-        
+        try:
+            return await retry_async(
+                _make_request,
+                max_attempts=3,
+                base_delay=1.0,
+            )
         except Exception as e:
-            log.warning(f"Groq failed ({e}) - falling back to Ollama")
+            log.warning(f"Groq failed after retries ({e}) - falling back to Ollama")
             return await self._call_ollama(prompt, self.ollama_model, json_mode)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -101,9 +130,15 @@ class LLMEngine:
     # ══════════════════════════════════════════════════════════════════════════
     
     async def _call_ollama(self, prompt: str, model: str, json_mode: bool = True) -> str:
-        """Call local Ollama API."""
+        """Call local Ollama API with caching."""
         import httpx
         import asyncio
+        
+        # Check cache first
+        cached = get_cached(prompt, model)
+        if cached:
+            log.info(f"  ⚡ Cache HIT for Ollama ({model})")
+            return cached
         
         payload = {
             "model": model,
@@ -123,7 +158,13 @@ class LLMEngine:
                 async with httpx.AsyncClient(timeout=600.0) as client:
                     response = await client.post(self.ollama_url, json=payload)
                     response.raise_for_status()
-                    return response.json().get("response", "").strip()
+                    result = response.json().get("response", "").strip()
+                    
+                    # Cache successful response
+                    if result:
+                        set_cached(prompt, model, result)
+                    
+                    return result
             
             except httpx.ConnectError as e:
                 raise RuntimeError(f"Cannot reach Ollama at {self.ollama_url}") from e

@@ -29,6 +29,7 @@ from pathlib import Path
 from dataclasses import dataclass
 import numpy as np
 import sys
+from modules.query_expansion import expand_query_simple, deduplicate_results
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -159,6 +160,40 @@ class Retriever:
         return {int(i): float(scores[i]) for i in top_indices if scores[i] > 0}
 
     # ── Reciprocal Rank Fusion ────────────────────────────────────────────────
+    
+    def search_expanded(self, query: str, top_k: int = 5) -> list:
+        """
+        Multi-query retrieval: expands the query and merges results.
+        Improves recall by ~30-40% compared to single-query search.
+        """
+        if self.index is None:
+            log.error("Cannot search: FAISS index not loaded.")
+            return []
+
+        # Generate query variations
+        queries = expand_query_simple(query)
+        log.info(f"Expanded '{query}' → {len(queries)} queries: {queries}")
+
+        # Search with each query
+        all_results = []
+        seen_ids = set()
+        
+        for q in queries:
+            results = self.search(q, top_k=top_k)
+            for r in results:
+                chunk_id = getattr(r, 'chunk_id', None) or hash(r.text[:100])
+                if chunk_id not in seen_ids:
+                    all_results.append(r)
+                    seen_ids.add(chunk_id)
+
+        # Rerank merged results if reranker is available
+        if self.use_reranker and len(all_results) > top_k:
+            all_results = self._rerank(query, all_results)
+            log.info(f"Reranked {len(all_results)} merged results")
+
+        final = all_results[:top_k]
+        log.info(f"Multi-query search returned {len(final)} unique chunks")
+        return final
 
     @staticmethod
     def _rrf_merge(

@@ -39,6 +39,10 @@ from modules.slide_generator import SlideData
 from modules.diagram_generator import generate_all_diagrams
 from modules.history_store import record_presentation, load_history, clear_history
 from modules.html_renderer import render as render_html
+from modules.context_manager import prepare_context_for_slides
+from modules.llm_cache import clear_cache, cache_stats
+from modules.evaluation import RAGEvaluator
+from modules.health import full_health_check, quick_status
 
 log = logging.getLogger("api")
 logging.basicConfig(level=logging.INFO)
@@ -265,12 +269,15 @@ async def generate_stream(
             # 3. Retrieve
             yield _emit("status", {"step": "retrieving", "message": "Retrieving context…"})
             retriever = Retriever(index_path=isolated_index)
-            results = retriever.search(prompt, top_k=top_k)
+            # Use expanded search for better retrieval coverage
+            results = retriever.search_expanded(prompt, top_k=top_k)
             
             # Build context text
-            context_text = "\n".join(f"[{c.source} p{c.page}] {c.text}" for c in results)
-            if len(context_text) > 3000:
-                context_text = context_text[:3000] + "\n[truncated]"
+            # Smart context preparation with sentence-boundary truncation
+            context_text = prepare_context_for_slides(
+                chunks=results,
+                num_slides=num_slides,
+            )
 
             # 4. Generate Slides
             yield _emit("status", {"step": "generating", "message": "AI is generating slides…"})
@@ -462,6 +469,51 @@ async def delete_history():
     clear_history()
     return {"status": "cleared"}
 
+@app.get("/cache/stats")
+async def get_cache_stats():
+    """Get LLM cache statistics."""
+    return cache_stats()
+
+@app.post("/evaluate")
+async def evaluate_query(
+    query: str = Form(...),
+    top_k: int = Form(5),
+):
+    """Evaluate RAG pipeline quality for a query."""
+    from modules.retrieval import Retriever
+    
+    retriever = Retriever()
+    evaluator = RAGEvaluator()
+    
+    chunks = retriever.search_expanded(query, top_k=top_k)
+    
+    if not chunks:
+        return {"error": "No chunks retrieved", "query": query}
+    
+    metrics = evaluator.evaluate_retrieval(query, chunks)
+    
+    return {
+        "query": query,
+        "metrics": metrics.to_dict(),
+        "summary": metrics.summary(),
+    }
+
+@app.delete("/cache")
+async def clear_llm_cache():
+    """Clear all cached LLM responses."""
+    count = clear_cache()
+    return {"status": "cleared", "entries_removed": count}
+
+@app.get("/health")
+async def health_check():
+    """Comprehensive system health check."""
+    return full_health_check()
+
+
+@app.get("/health/quick")
+async def quick_health():
+    """Lightweight status for frequent polling."""
+    return quick_status()
 
 if __name__ == "__main__":
     import uvicorn

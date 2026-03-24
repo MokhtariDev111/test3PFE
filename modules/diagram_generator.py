@@ -41,14 +41,32 @@ if not log.hasHandlers():
 # ── Mermaid generators ────────────────────────────────────────────────────────
 
 def _safe(text: str, max_len: int = 120) -> str:
-    """Escape quotes and truncate for Mermaid labels."""
-    return text.replace('"', "'").replace('\n', ' ')[:max_len]
+    """Escape special characters and truncate for Mermaid labels."""
+    if not text:
+        return ""
+    # Remove/replace characters that break Mermaid syntax
+    result = str(text)
+    result = result.replace('"', "'")
+    result = result.replace('\n', ' ')
+    result = result.replace('\r', ' ')
+    result = result.replace('[', '(')
+    result = result.replace(']', ')')
+    result = result.replace('{', '(')
+    result = result.replace('}', ')')
+    result = result.replace('<', '')
+    result = result.replace('>', '')
+    result = result.replace('|', '-')
+    result = result.replace('#', '')
+    result = result.replace('&', 'and')
+    # Clean up multiple spaces
+    result = ' '.join(result.split())
+    return result[:max_len].strip()
 
 
-def _to_diagram_labels(bullets: list[str], max_len: int = 100) -> list[str]:
+def _to_diagram_labels(bullets: list[str], max_len: int = 20) -> list[str]:
     """
-    Convert bullet text into expressive, complete diagram labels.
-    Removes aggressive truncation so sentences remain readable.
+    Convert bullet text into SHORT diagram labels.
+    Extracts only the keyword/concept part for clean node labels.
     """
     out = []
     seen = set()
@@ -57,46 +75,59 @@ def _to_diagram_labels(bullets: list[str], max_len: int = 100) -> list[str]:
         if not s:
             continue
         
-        # Take first phrase if it's very long, but allow up to 15 words
-        words = s.split()
-        if len(words) > 15:
-            s = " ".join(words[:15]) + "..."
-            
-        s = _safe(s, max_len)
-        key = s.lower()
-        if key and key not in seen:
+        # Remove bold/italic markdown
+        s = s.replace("**", "").replace("*", "")
+        
+        # Extract keyword before colon or hyphen
+        if ':' in s:
+            keyword = s.split(':', 1)[0].strip()
+        elif '-' in s:
+            keyword = s.split('-', 1)[0].strip()
+        else:
+            # Take first 3-4 words as the concept
+            words = s.split()
+            keyword = " ".join(words[:4])
+        
+        # Clean and limit length for diagram nodes
+        keyword = _safe(keyword, max_len)
+        
+        # Skip duplicates
+        key = keyword.lower()
+        if key and key not in seen and len(keyword) > 2:
             seen.add(key)
-            out.append(s)
+            out.append(keyword)
     return out
 
 
 def _mermaid_flowchart(title: str, steps: list[str]) -> str:
-    labels = _to_diagram_labels(steps) if steps else steps
+    labels = _to_diagram_labels(steps, max_len=20) if steps else steps
     lines = ["flowchart TD"]
     ids   = [chr(65 + i) for i in range(min(len(labels), 7))]
     for nid, step in zip(ids, labels):
-        lines.append(f'  {nid}["{_safe(step, 35)}"]')
+        lines.append(f'  {nid}["{_safe(step, 20)}"]')
     for i in range(len(ids) - 1):
         lines.append(f"  {ids[i]} --> {ids[i+1]}")
     return "\n".join(lines)
 
 
 def _mermaid_mindmap(title: str, items: list[str], key_message: str = "") -> str:
-    root = key_message.strip() or title
-    lines = ["mindmap", f'  root(("{_safe(root, 30)}"))']
-    labels = _to_diagram_labels(items)
+    # Use key_message or extract keyword from title
+    root = key_message.strip() if key_message.strip() else (title.split(':')[0].strip() if ':' in title else title)
+    root = _safe(root, 20)
+    lines = ["mindmap", f'  root(("{root}"))']
+    labels = _to_diagram_labels(items, max_len=20)
     for item in labels[:6]:
-        lines.append(f'    ("{_safe(item, 25)}")')
+        lines.append(f'    ("{_safe(item, 20)}")')
     return "\n".join(lines)
 
 
 def _mermaid_timeline(title: str, items: list[str]) -> str:
-    labels = _to_diagram_labels(items)
-    lines = ["timeline", f"  title {_safe(title, 40)}"]
+    labels = _to_diagram_labels(items, max_len=20)
+    # Extract short title
+    short_title = title.split(':')[0].strip() if ':' in title else title[:30]
+    lines = ["timeline", f"  title {_safe(short_title, 30)}"]
     for i, item in enumerate(labels[:5]):
-        # Use short step labels to avoid repetition
-        step_label = f"Step {i+1}" if len(labels) > 3 else item[:20]
-        lines.append(f"  {step_label} : {_safe(item, 35)}")
+        lines.append(f"  Phase {i+1} : {_safe(item, 20)}")
     return "\n".join(lines)
 
 
@@ -104,46 +135,50 @@ def _mermaid_comparison(title: str, items: list[str]) -> str:
     """Two-branch flowchart — split by logical pairs (e.g. A vs B)."""
     if len(items) < 2:
         return _mermaid_flowchart(title, items)
-    labels = _to_diagram_labels(items)
+    labels = _to_diagram_labels(items, max_len=20)
     mid   = (len(labels) + 1) // 2
     left  = labels[:mid]
     right = labels[mid:]
-    lines = ["flowchart TD", f'  ROOT["{_safe(title, 30)}"]']
-    lines.append(f'  L["{_safe(left[0], 30)}"]')
-    lines.append(f'  R["{_safe(right[0], 30)}"]')
+    # Extract short title
+    short_title = title.split(':')[0].strip() if ':' in title else title[:25]
+    lines = ["flowchart TD", f'  ROOT["{_safe(short_title, 20)}"]']
+    lines.append(f'  L["{_safe(left[0], 20)}"]')
+    lines.append(f'  R["{_safe(right[0] if right else "Option B", 20)}"]')
     lines.append("  ROOT --> L")
     lines.append("  ROOT --> R")
     for i, item in enumerate(left[1:], 1):
-        lines.append(f'  L{i}["{_safe(item, 28)}"]')
+        lines.append(f'  L{i}["{_safe(item, 20)}"]')
         lines.append(f"  L --> L{i}")
     for i, item in enumerate(right[1:], 1):
-        lines.append(f'  R{i}["{_safe(item, 28)}"]')
+        lines.append(f'  R{i}["{_safe(item, 20)}"]')
         lines.append(f"  R --> R{i}")
     return "\n".join(lines)
 
 
 def _mermaid_process(title: str, steps: list[str]) -> str:
     """Cyclical process — flowchart with return arrow."""
-    labels = _to_diagram_labels(steps) if steps else steps
+    labels = _to_diagram_labels(steps, max_len=20) if steps else steps
     lines = ["flowchart TD"]
     ids   = [chr(65 + i) for i in range(min(len(labels), 6))]
     for nid, step in zip(ids, labels):
-        lines.append(f'  {nid}["{_safe(step)}"]')
+        lines.append(f'  {nid}["{_safe(step, 20)}"]')
     for i in range(len(ids) - 1):
         lines.append(f"  {ids[i]} --> {ids[i+1]}")
     if len(ids) >= 2:
-        lines.append(f"  {ids[-1]} -.->|cycle| {ids[0]}")
+        lines.append(f"  {ids[-1]} -.->|repeat| {ids[0]}")
     return "\n".join(lines)
 
 
 def _mermaid_hierarchy(title: str, items: list[str], key_message: str = "") -> str:
     """Tree hierarchy — root fans out to children."""
-    root = key_message.strip() or title
-    lines = ["flowchart TD", f'  ROOT["{_safe(root, 30)}"]']
-    labels = _to_diagram_labels(items)
+    # Use key_message or extract keyword from title
+    root = key_message.strip() if key_message.strip() else (title.split(':')[0].strip() if ':' in title else title)
+    root = _safe(root, 20)
+    lines = ["flowchart TD", f'  ROOT["{root}"]']
+    labels = _to_diagram_labels(items, max_len=20)
     for i, item in enumerate(labels[:6]):
         nid = f"N{i}"
-        lines.append(f'  {nid}["{_safe(item)}"]')
+        lines.append(f'  {nid}["{_safe(item, 20)}"]')
         lines.append(f"  ROOT --> {nid}")
     return "\n".join(lines)
 

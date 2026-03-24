@@ -28,7 +28,7 @@ text_processing:
 
 # Step 5 — Embeddings
 embeddings:
-  model: "BAAI/bge-small-en-v1.5"
+  model: "BAAI/bge-base-en-v1.5"
   device: "cuda"             # CHANGED: use CPU to free GPU for Ollama (embedding is fast enough on CPU)
 
 # Step 5 — Vector DB

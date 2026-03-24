@@ -71,6 +71,16 @@ def _auto_theme(pres_id: str) -> str:
 def _esc(s: str) -> str:
     return (str(s or "")).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"','&quot;').replace("'","&#39;").replace("\n"," ")
 
+def _esc_mermaid(s: str) -> str:
+    """
+    Escape for Mermaid diagrams - minimal escaping to preserve syntax.
+    Keeps > for arrows (-->) and prevents escaping & to avoid breaking mermaid.
+    """
+    if not s:
+        return ""
+    # Avoid escaping & and > to preserve --> and other mermaid syntax.
+    return str(s).replace("<", "&lt;")
+
 def _rgb(h: str) -> tuple:
     h = h.lstrip("#")
     if len(h) == 3: h = "".join([c*2 for c in h])
@@ -231,7 +241,6 @@ def _slide_content(s: dict, i: int, tot: int, t: dict, img: any) -> tuple:
     bullets = s.get("bullets", [])
     notes   = _esc(s.get("speaker_notes", ""))
     num     = f"{i+1:02d}/{tot:02d}"
-    bs, bo  = _img_style(img)
     a, a2, a3 = t["a"], t["a2"], t["a3"]
 
     bhtml = ""
@@ -253,20 +262,32 @@ def _slide_content(s: dict, i: int, tot: int, t: dict, img: any) -> tuple:
     
     diag_html = ""
     if s.get("diagram"):
-        diag_html = f'<div class="diagram-box"><pre class="mermaid">{_esc(s["diagram"])}</pre></div>'
+        diag_html = f'<div class="diagram-box"><pre class="mermaid">{_esc_mermaid(s["diagram"])}</pre></div>'
+
+    img_html = ""
+    if img:
+        src = img.get("url") if isinstance(img, dict) else img
+        if src:
+            safe = src.replace("'", "%27").replace('"', '&quot;')
+            img_html = f'<div class="inline-image-box"><img src="{safe}" class="inline-content-img" alt="Slide Image" /></div>'
+
+    layout_class = "content-layout-split" if img_html else "content-layout-single"
+
+    right_col = f'<div class="content-right">{img_html}</div>' if img_html else ""
 
     return (
         f'<section class="slide s-content" data-idx="{i}" data-ac="{a}" style="--a:{a};--a2:{a2};--a3:{a3}">'
         f'<div class="mesh subtle" style="--c1:{a};--c2:{a2};--c3:{a3}"></div>'
         f'{_particles(i, a)}'
-        f'<div class="imgwrap"{bs}>{bo}</div>'
         f'<div class="rail" style="background:linear-gradient(180deg,{a},{a2}66,transparent)"></div>'
         f'<div class="inner">'
         f'  <div class="eyebrow"><span class="etag" style="background:{a}18;border-color:{a}30;color:{a}">SLIDE {i+1:02d}</span></div>'
         f'  <h2 class="stitle">{title}</h2>'
         f'  <div class="rule" style="background:linear-gradient(90deg,{a},{a2}88,transparent)"></div>'
-        f'  <div class="bullets">{bhtml}</div>'
-        f'  {diag_html}'
+        f'  <div class="{layout_class}">'
+        f'    <div class="content-left"><div class="bullets">{bhtml}</div>{diag_html}</div>'
+        f'    {right_col}'
+        f'  </div>'
         f'</div>'
         f'<div class="orb oa sm" style="background:radial-gradient(circle,{a}20,transparent 65%)"></div>'
         f'<div class="notes" data-n="{notes}">{s.get("speaker_notes","")}</div>'
@@ -371,11 +392,30 @@ def _slide_comparison(s: dict, i: int, tot: int, t: dict, img: any) -> tuple:
     ), ""
 
 def _slide_outro(s: dict, i: int, tot: int, t: dict, img: any, topic: str) -> tuple:
-    title = _esc(s.get("title", "Thank You"))
+    title = _esc(s.get("title", "Conclusion"))
     notes = _esc(s.get("speaker_notes", ""))
+    bullets = s.get("bullets", [])
     num   = f"{i+1:02d}/{tot:02d}"
     bs, bo = _img_style(img)
     a, a2, a3 = t["a"], t["a2"], t["a3"]
+    r, g, b = _rgb(a)
+    
+    # Build bullet HTML for conclusion points
+    bhtml = ""
+    for j, bu in enumerate(bullets[:6]):
+        bull = bu.get("text", "") or bu.get("content", "") if isinstance(bu, dict) else str(bu)
+        ac = a2 if j % 2 else a
+        ra, ga, ba = _rgb(ac)
+        d = 0.3 + j * 0.12
+        bhtml += (
+            f'<div class="outro-point" style="--d:{d:.2f}s;opacity:0;animation:fup .6s both var(--d)">'
+            f'<span class="outro-bullet" style="background:{ac}"></span>'
+            f'<span class="outro-text">{_esc(bull)}</span>'
+            f'</div>'
+        )
+    
+    bullets_section = f'<div class="outro-bullets">{bhtml}</div>' if bhtml else ''
+    
     return (
         f'<section class="slide s-outro" data-idx="{i}" data-ac="{a}" style="--a:{a};--a2:{a2};--a3:{a3}">'
         f'<div class="mesh" style="--c1:{a3};--c2:{a};--c3:{a2}"></div>'
@@ -385,6 +425,7 @@ def _slide_outro(s: dict, i: int, tot: int, t: dict, img: any, topic: str) -> tu
         f'<div class="outro-body">'
         f'  <div class="outro-ring"><svg viewBox="0 0 120 120" class="rsv"><circle cx="60" cy="60" r="54" fill="none" stroke="{a}" stroke-width="1" stroke-dasharray="4 8" opacity=".4"/><text x="60" y="67" text-anchor="middle" font-size="28" fill="{a}" font-weight="800">✦</text></svg></div>'
         f'  <h2 class="outro-h">{title}</h2>'
+        f'  {bullets_section}'
         f'  <div class="outro-topic" style="color:{a2}">{_esc(topic)}</div>'
         f'  <p class="outro-cta">Press <kbd>Q</kbd> to take questions</p>'
         f'</div>'
@@ -443,6 +484,28 @@ html,body{{width:100%;height:100%;overflow:hidden;background:{bg};color:{ink};fo
 .diagram-box{{margin-top:25px;background:rgba(255,255,255,.03);border:1px solid rgba({r},{g},{b},.1);border-radius:12px;padding:20px;overflow:hidden;opacity:0;animation:fup .6s both .6s}}
 .mermaid{{background:transparent !important;color:{ink} !important}}
 .mermaid svg{{max-width:100%;height:auto;filter:drop-shadow(0 10px 20px rgba(0,0,0,.3))}}
+.content-layout-split{{display:flex;gap:40px;align-items:center}}
+.content-left{{flex:1}}
+.content-right{{flex:1;display:flex;justify-content:center}}
+.inline-image-box{{border-radius:16px;overflow:hidden;box-shadow:0 20px 40px rgba(0,0,0,0.4);border:1px solid rgba({r},{g},{b},0.3);max-height:500px;opacity:0;animation:fup .6s both .4s}}
+.inline-content-img{{width:100%;height:auto;display:block;object-fit:cover;max-height:500px}}
+.outro-bullets{{display:flex;flex-direction:column;gap:12px;margin:24px 0;max-width:700px}}
+.outro-point{{display:flex;align-items:flex-start;gap:14px}}
+.outro-bullet{{width:8px;height:8px;border-radius:50%;margin-top:8px;flex-shrink:0}}
+.outro-text{{font-size:17px;line-height:1.6;color:{muted}}}
+.s-outro{{text-align:center}}
+.outro-body{{position:relative;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px;max-width:900px}}
+.outro-ring{{width:100px;height:100px;margin-bottom:30px;animation:float 3s ease-in-out infinite}}
+@keyframes float{{0%,100%{{transform:translateY(0)}}50%{{transform:translateY(-10px)}}}}
+.rsv{{width:100%;height:100%}}
+.outro-h{{font-family:'Plus Jakarta Sans',sans-serif;font-size:clamp(36px,5vw,72px);font-weight:800;letter-spacing:-2px;margin-bottom:16px;background:linear-gradient(135deg,{a},{a2});-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}}
+.outro-topic{{font-size:18px;margin-bottom:24px;opacity:0.7}}
+.outro-cta{{font-size:13px;color:{muted};margin-top:20px}}
+.outro-cta kbd{{background:{surf};border:1px solid {brd};padding:4px 10px;border-radius:6px;font-family:monospace}}
+.orbs{{position:absolute;inset:0;pointer-events:none;overflow:hidden}}
+.orb{{position:absolute;border-radius:50%;filter:blur(80px);animation:orb-float 8s ease-in-out infinite}}
+.orb.oa{{width:400px;height:400px;bottom:-100px;right:-100px}}
+@keyframes orb-float{{0%,100%{{transform:translate(0,0)}}50%{{transform:translate(-20px,-20px)}}}}
 """
 
 # ── JS ────────────────────────────────────────────────────────────────────────
@@ -470,7 +533,32 @@ _JS = r"""
   }
   function initMermaid(){
     if(window.mermaid){
-      mermaid.initialize({startOnLoad:true,theme:'dark',securityLevel:'loose',flowchart:{useMaxWidth:true,htmlLabels:true}});
+      mermaid.initialize({
+        startOnLoad:false,
+        theme:'dark',
+        securityLevel:'loose',
+        flowchart:{useMaxWidth:true,htmlLabels:true},
+        suppressErrorRendering:true
+      });
+      // Render all mermaid diagrams on active slide
+      setTimeout(function(){
+        const active = document.querySelector('.slide.active');
+        if(active){
+          const diagrams = active.querySelectorAll('.mermaid');
+          diagrams.forEach(function(el, idx){
+            try {
+              mermaid.render('mermaid-'+idx, el.textContent).then(function(result){
+                el.innerHTML = result.svg;
+              }).catch(function(err){
+                console.warn('Mermaid render failed:', err);
+                el.innerHTML = '<div style="color:#ff6b6b;padding:10px">Diagram unavailable</div>';
+              });
+            } catch(e) {
+              console.warn('Mermaid error:', e);
+            }
+          });
+        }
+      }, 100);
     }
   }
   window._PI=init;
@@ -487,7 +575,20 @@ function goTo(n,fwd=true){
   SL[n].classList.remove('xl','xr');
   SL[n].classList.add('active');
   const pc=SL[n].querySelector('.pc');if(pc)window._PI(pc);
-  if(window.mermaid)mermaid.init(undefined, SL[n].querySelectorAll('.mermaid'));
+  // Render mermaid diagrams on the new slide
+  if(window.mermaid){
+    const diagrams = SL[n].querySelectorAll('.mermaid:not([data-processed])');
+    diagrams.forEach(function(el, idx){
+      el.setAttribute('data-processed', 'true');
+      const code = el.textContent;
+      mermaid.render('mermaid-'+n+'-'+idx, code).then(function(result){
+        el.innerHTML = result.svg;
+      }).catch(function(err){
+        console.warn('Mermaid render failed:', err);
+        el.innerHTML = '<div style="color:#ff6b6b;padding:10px;font-size:12px">Diagram unavailable</div>';
+      });
+    });
+  }
   cur=n;upd();
 }
 function fwd(){goTo(cur+1,true)}
@@ -513,6 +614,7 @@ document.addEventListener('mousemove',e=>{
   r.style.left=e.clientX+'px';r.style.top=e.clientY+'px';
 });
 (function init(){
+  SL[0].classList.add('active');
   const pc=SL[0].querySelector('.pc');if(pc)window._PI(pc);
   window._IM();
   upd();
