@@ -250,6 +250,10 @@ def _slide_content(s: dict, i: int, tot: int, t: dict, img: any) -> tuple:
             + (f'<span class="brest">{_esc(rest)}</span>' if rest else '')
             + f'</div></div>'
         )
+    
+    diag_html = ""
+    if s.get("diagram"):
+        diag_html = f'<div class="diagram-box"><pre class="mermaid">{_esc(s["diagram"])}</pre></div>'
 
     return (
         f'<section class="slide s-content" data-idx="{i}" data-ac="{a}" style="--a:{a};--a2:{a2};--a3:{a3}">'
@@ -262,6 +266,7 @@ def _slide_content(s: dict, i: int, tot: int, t: dict, img: any) -> tuple:
         f'  <h2 class="stitle">{title}</h2>'
         f'  <div class="rule" style="background:linear-gradient(90deg,{a},{a2}88,transparent)"></div>'
         f'  <div class="bullets">{bhtml}</div>'
+        f'  {diag_html}'
         f'</div>'
         f'<div class="orb oa sm" style="background:radial-gradient(circle,{a}20,transparent 65%)"></div>'
         f'<div class="notes" data-n="{notes}">{s.get("speaker_notes","")}</div>'
@@ -435,6 +440,9 @@ html,body{{width:100%;height:100%;overflow:hidden;background:{bg};color:{ink};fo
 .notes{{display:none;position:fixed;bottom:0;left:0;right:0;background:rgba({r},{g},{b},.95);backdrop-filter:blur(20px);padding:30px 60px;font-family:monospace;z-index:150}}
 .notes-on .notes{{display:block}}
 .snum{{position:absolute;bottom:25px;right:30px;font-size:10px;color:{muted}}}
+.diagram-box{{margin-top:25px;background:rgba(255,255,255,.03);border:1px solid rgba({r},{g},{b},.1);border-radius:12px;padding:20px;overflow:hidden;opacity:0;animation:fup .6s both .6s}}
+.mermaid{{background:transparent !important;color:{ink} !important}}
+.mermaid svg{{max-width:100%;height:auto;filter:drop-shadow(0 10px 20px rgba(0,0,0,.3))}}
 """
 
 # ── JS ────────────────────────────────────────────────────────────────────────
@@ -460,7 +468,13 @@ _JS = r"""
     }
     draw();
   }
+  function initMermaid(){
+    if(window.mermaid){
+      mermaid.initialize({startOnLoad:true,theme:'dark',securityLevel:'loose',flowchart:{useMaxWidth:true,htmlLabels:true}});
+    }
+  }
   window._PI=init;
+  window._IM=initMermaid;
 })();
 
 const SL=Array.from(document.querySelectorAll('.slide'));
@@ -473,6 +487,7 @@ function goTo(n,fwd=true){
   SL[n].classList.remove('xl','xr');
   SL[n].classList.add('active');
   const pc=SL[n].querySelector('.pc');if(pc)window._PI(pc);
+  if(window.mermaid)mermaid.init(undefined, SL[n].querySelectorAll('.mermaid'));
   cur=n;upd();
 }
 function fwd(){goTo(cur+1,true)}
@@ -498,8 +513,8 @@ document.addEventListener('mousemove',e=>{
   r.style.left=e.clientX+'px';r.style.top=e.clientY+'px';
 });
 (function init(){
-  SL[0].classList.add('active');
   const pc=SL[0].querySelector('.pc');if(pc)window._PI(pc);
+  window._IM();
   upd();
 })();
 """
@@ -537,6 +552,7 @@ def render(
     html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"/><title>{te} — Presentation</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
 <style>{_css(theme)}</style></head>
 <body><div id="cur"></div><div id="cur2"></div>

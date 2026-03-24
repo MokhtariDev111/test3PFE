@@ -43,9 +43,9 @@ retrieval:
   bm25_weight: 0.5           # 0.0 = dense only, 1.0 = BM25 only (RRF makes this soft)
 
   # Cross-encoder reranker — runs on top-N candidates after hybrid search
-  use_reranker: false        # CHANGED: disabled to save GPU memory (reranker uses ~280MB VRAM)
+  use_reranker: true       # CHANGED: disabled to save GPU memory (reranker uses ~280MB VRAM)
   reranker_model: "BAAI/bge-reranker-base"
-  reranker_top_n: 20
+  reranker_top_n: 5
 
 # Step 7 — LLM (Ollama Backend)
 llm:
@@ -60,7 +60,7 @@ llm:
   # Set to the same as `model` to use one model for everything (cheaper).
   # Set to a stronger model (e.g. "llama3:8b") for better quality filtering.
   judge_model: "mistral"
-  judge_enabled: false       # CHANGED: disabled to reduce LLM calls and save time
+  judge_enabled: false      # CHANGED: disabled to reduce LLM calls and save time
 
 # ── NEW: Generation settings ─────────────────────────────────────────────────
 generation:

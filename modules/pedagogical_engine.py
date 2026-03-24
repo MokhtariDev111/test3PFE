@@ -43,10 +43,11 @@ if not log.hasHandlers():
 
 # ── Pedagogical arc ───────────────────────────────────────────────────────────
 # Slide types in teaching order: define → explain → illustrate → compare → summarize
+# Slide types follow the user's preferred curriculum order
 SLIDE_ARC = [
-    "definition", "concept", "concept", "example", "comparison",
-    "example", "summary", "concept", "comparison", "definition",
-    "example", "summary", "concept", "comparison", "summary",
+    "intro", "definition", "concept", "example", "process", 
+    "comparison", "case_study", "summary", "concept", "example",
+    "process", "comparison", "summary"
 ]
 
 # ── JSON schema shown in every prompt ─────────────────────────────────────────
@@ -54,16 +55,16 @@ _ONE_SLIDE_SCHEMA = """{
   "slide_type": "concept",
   "title": "Slide Title Here",
   "bullets": [
-    {"text": "Specific fact or mechanism with a concrete detail", "source_id": "source or General Knowledge"},
-    {"text": "Second distinct point — no overlap with bullet 1", "source_id": "source or General Knowledge"},
-    {"text": "Third point — real example or implication", "source_id": "source or General Knowledge"}
+    {"text": "Specific fact, mechanism, or data point with concrete detail", "source_id": "Page X or Source Name"},
+    {"text": "Second distinct, non-overlapping point advancing the lesson", "source_id": "Page Y or Source Name"},
+    {"text": "Third point — application, implication, or real-world example", "source_id": "Page Z or Source Name"}
   ],
-  "key_message": "One-sentence synthesis NOT present in the bullets",
+  "key_message": "One-sentence high-level synthesis NOT present in the bullets",
   "visual_hint": "flowchart",
   "image_id": "Exact Image ID from list or null",
-  "speaker_notes": "One or two short sentences.",
+  "speaker_notes": "One or two short sentences explaining the 'why' behind the facts.",
   "quality_score": 8,
-  "quality_feedback": "Brief reason why this score was given."
+  "quality_feedback": "Brief reason why this score was given, focusing on specificity and no repetition."
 }"""
 
 # ── Sub-query templates (per-slide targeted retrieval) ────────────────────────
@@ -146,15 +147,14 @@ JSON schema:
 
 Rules:
 1. slide_type must be exactly: {slide_type}
-2. bullets: exactly 3. Each must contain a specific fact, number, or real mechanism. Never vague.
-3. key_message: one sentence — must NOT repeat any bullet text.
-4. visual_hint: different from recent hints ({used_hints}). Suggested: "{suggested}". 
-   Choose from: flowchart, mindmap, timeline, comparison, process, hierarchy, none
-5. speaker_notes: 1-2 short sentences.
-6. All content in {language}.
-7. quality_score: honestly rate 1-10. Be strict. Vague slides score 3-5.
-8. Output starts with {{ and ends with }}. No markdown.
-9. Do NOT repeat previous slide titles: {prior_str}
+2. **CONTENT CREATIVITY**: Use analogies and fresh examples. DO NOT copy text verbatim from the context. Re-explain in a teaching tone.
+3. **CONTENT DEPTH**: Every bullet MUST contain a specific fact, date, statistic, or mechanism. No generic filler.
+4. **NO REPETITION**: Check previous slides: {prior_str}. DO NOT repeat information or sentence structures.
+5. **KEY MESSAGE**: A strategic takeaway or analogy that summarizes the slide's purpose.
+6. **VISUAL HINT**: Mandatory. Suggested: "{suggested}". Choose from: flowchart, mindmap, timeline, comparison, process, hierarchy, none.
+7. **MOTION HINTS**: For each bullet, focus on a "stepwise build". Mention in speaker_notes how the animator should handle the build for maximum impact.
+8. All content in {language}.
+9. Output starts with {{ and ends with }}. No markdown. No conversational filler.
 {image_rule}
 
 Context from documents:
